@@ -80,4 +80,5 @@ obj-$(CONFIG_DRM_PANEL_ORIENTATION_QUIRKS) += drm_panel_orientation_quirks.o
 obj-$(CONFIG_DRM_TTM)	+= ttm/
 obj-$(CONFIG_DRM_SCHED)	+= scheduler/
 obj-$(CONFIG_DRM_AMDGPU)+= amd/amdgpu/
+obj-$(CONFIG_DRM_RADEON) += radeon/
 obj-$(CONFIG_DRM_I915)	+= i915/

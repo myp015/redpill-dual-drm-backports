@@ -157,13 +157,14 @@ static inline void cpuhp_remove_multi_state(int state) { }
 #include <linux/pm_runtime.h>
 static inline u64 pm_runtime_suspended_time(struct device *dev) { return 0; }
 
-/* --- MODULE_FIRMWARE / MODULE_PARM_DESC: Synology 4.4.302 fails on string
- * concatenation args. Replace with no-ops (modinfo annotations only). */
+/* --- MODULE_FIRMWARE: 4.4.302 的 module.h 是 vanilla 定义
+ * (#define MODULE_FIRMWARE(_f) MODULE_INFO(firmware, _f))，可直接使用。
+ * 曾这里覆盖成空宏，导致 .modinfo 没有 firmware= 条目、发布流程收集不到
+ * i915/amdgpu/radeon 固件（实机上 GuC 加载 -2 ENOENT）。 */
 #include <linux/module.h>
-#ifdef MODULE_FIRMWARE
-#undef MODULE_FIRMWARE
+#ifndef MODULE_FIRMWARE
+#define MODULE_FIRMWARE(_fw) MODULE_INFO(firmware, _fw)
 #endif
-#define MODULE_FIRMWARE(_fw) /* noop */
 
 /* --- math: DIV64_U64_ROUND_UP (5.2+) --- */
 #ifndef DIV64_U64_ROUND_UP

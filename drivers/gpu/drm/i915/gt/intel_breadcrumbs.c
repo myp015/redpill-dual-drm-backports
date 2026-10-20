@@ -190,7 +190,11 @@ void intel_engine_breadcrumbs_irq(struct intel_engine_cs *engine)
 		struct list_head cb_list;
 
 		spin_lock(&rq->lock);
-		list_replace(&rq->fence.cb_list, &cb_list);
+		/* 4.4.302: cb_list 与 timestamp 是独立字段（5.4 是 union），
+		 * 后面的 __dma_fence_signal__timestamp() 不会覆盖旧链表头，
+		 * 必须用 list_replace_init() 显式复位，否则 dma_fence_release
+		 * 的 WARN_ON(!list_empty(&fence->cb_list)) 每次触发。 */
+		list_replace_init(&rq->fence.cb_list, &cb_list);
 		__dma_fence_signal__timestamp(&rq->fence, timestamp);
 		__dma_fence_signal__notify(&rq->fence, &cb_list);
 		spin_unlock(&rq->lock);

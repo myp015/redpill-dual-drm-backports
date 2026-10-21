@@ -195,6 +195,25 @@ static inline u64 pm_runtime_suspended_time(struct device *dev) { return 0; }
 #define wake_up_var(var)						\
 	do { wake_up_all(bit_waitqueue((void *)(var), 0)); } while (0)
 #define init_var_waiter(wq) /* noop */
+
+/*
+ * 带超时的可中断等待（4.13+ 的 wait_event_killable_timeout，4.4 没有）。
+ * 直接用 4.4 wait.h 里的 ___wait_event + ___wait_cond_timeout 拼出同语义：
+ * TASK_KILLABLE + schedule_timeout() 递减，返回值 >0 条件成立、0 超时、
+ * <0 被信号打断。___wait_event 内部写 &wq，而 wq 传的是 *bit_waitqueue(...)，
+ * &*p 等价于 p，不会复制队列头。
+ *
+ * Task#208 用它给 i915 的 intel_wakeref_wait_for_idle() 加超时诊断：
+ * 4.4 上该等待可能永久不返回（probe 阶段 gt->wakeref 不归零），
+ * 卡住的是持有 struct_mutex 的 udevd，进而与 __i915_gem_free_work 死锁。
+ */
+#define wait_var_event_killable_timeout(var, cond, timeout)		\
+({									\
+	wait_queue_head_t *__vwqh = bit_waitqueue((void *)(var), 0);	\
+	___wait_event(*__vwqh, ___wait_cond_timeout(cond),		\
+		      TASK_KILLABLE, 0, (timeout),			\
+		      __ret = schedule_timeout(__ret));			\
+})
 #endif
 
 /* --- refcount: refcount_dec_and_lock_irqsave (5.1+) --- */

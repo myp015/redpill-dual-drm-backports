@@ -213,8 +213,18 @@ void i915_gem_flush_free_objects(struct drm_i915_private *i915)
 {
 	struct llist_node *freed = llist_del_all(&i915->mm.free_list);
 
-	if (unlikely(freed))
+	if (unlikely(freed)) {
+		/*
+		 * Task#208：__i915_gem_free_objects() 先 intel_runtime_pm_get()
+		 * 再 mutex_lock(struct_mutex)，是 probe 阶段 ABBA 死锁的另一半。
+		 * 这两行默认不可见，用 echo 0x1e > /sys/module/drm/parameters/debug
+		 * 打开；卡住时日志会停在 enter 而没有 done。
+		 */
+		DRM_DEBUG_DRIVER("free_objects: enter (rpm_count=%d)\n",
+				 atomic_read(&i915->runtime_pm.wakeref_count));
 		__i915_gem_free_objects(i915, freed);
+		DRM_DEBUG_DRIVER("free_objects: done\n");
+	}
 }
 
 static void __i915_gem_free_work(struct work_struct *work)

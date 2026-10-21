@@ -1482,14 +1482,34 @@ int i915_gem_init(struct drm_i915_private *dev_priv)
 
 	intel_uc_init(&dev_priv->gt.uc);
 
+	/*
+	 * Task#208：probe 阶段曾出现 udevd 持 struct_mutex 卡在
+	 * intel_wakeref_wait_for_idle()。这三个里程碑 + GT wakeref 计数
+	 * 用来判断引用是在 init_hw 还是 gt_resume 之后泄漏的。
+	 */
+	dev_info(dev_priv->drm.dev,
+		 "i915 probe: gem_init init_hw start (gt count=%d wakeref=%u)\n",
+		 atomic_read(&dev_priv->gt.wakeref.count),
+		 dev_priv->gt.wakeref.wakeref);
+
 	ret = i915_gem_init_hw(dev_priv);
 	if (ret)
 		goto err_uc_init;
+
+	dev_info(dev_priv->drm.dev,
+		 "i915 probe: gem_init init_hw done, ret=%d (gt count=%d wakeref=%u)\n",
+		 ret, atomic_read(&dev_priv->gt.wakeref.count),
+		 dev_priv->gt.wakeref.wakeref);
 
 	/* Only when the HW is re-initialised, can we replay the requests */
 	ret = intel_gt_resume(&dev_priv->gt);
 	if (ret)
 		goto err_init_hw;
+
+	dev_info(dev_priv->drm.dev,
+		 "i915 probe: gem_init gt_resume done (gt count=%d wakeref=%u)\n",
+		 atomic_read(&dev_priv->gt.wakeref.count),
+		 dev_priv->gt.wakeref.wakeref);
 
 	/*
 	 * Despite its name intel_init_clock_gating applies both display

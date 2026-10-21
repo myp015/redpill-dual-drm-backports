@@ -646,9 +646,16 @@ execlists_schedule_out(struct i915_request *rq)
 	if (!cur)
 		__execlists_schedule_out(rq, old);
 
-	/* 4.4.302 backport: signal fence before put to drain cb_list,
-	 * preventing dma_fence_release WARN from IRQ/softirq context. */
-	dma_fence_signal(&rq->fence);
+	/*
+	 * Task#208：此处绝不能提前 dma_fence_signal(&rq->fence)。
+	 * 本函数在 CSB_PREEMPT（preempt-to-busy，请求仍在飞行）和
+	 * cancel_port_requests()（复位，请求可能根本没上过硬件）里被调用，
+	 * 提前 signal 会让 i915_request_completed() 因 SIGNALED 位直接返回真，
+	 * 进而跳过 __unwind_incomplete_requests() 的重新入队、留下永不 retire 的
+	 * 僵尸请求，并把 fence 完成的回调（→ submit_notify → 嵌套 dequeue）
+	 * 注入到 process_csb 的中间状态。上游只在请求真正完成（retire，
+	 * 或等待路径确认 seqno 已过）时才 signal。
+	 */
 	i915_request_put(rq);
 }
 

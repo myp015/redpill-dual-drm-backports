@@ -108,6 +108,24 @@ static void i915_fence_release(struct dma_fence *fence)
 	i915_sw_fence_fini(&rq->submit);
 	i915_sw_fence_fini(&rq->semaphore);
 
+	/*
+	 * Task#208：4.4.302 的 dma_fence_release() 带
+	 * WARN_ON(!list_empty(&fence->cb_list))。cb_list 非空等价于该 fence
+	 * 从未 signal（signal 会排空 cb_list），所以在释放前先把请求身份打出来，
+	 * 让那条 WARN 能对应到具体请求，而不是靠提前 signal 掩盖（见 intel_lrc.c
+	 * execlists_schedule_out() 的说明）。
+	 */
+	if (!i915_request_signaled(rq)) {
+		static bool warned;
+
+		if (!warned) {
+			warned = true;
+			dev_warn(rq->i915->drm.dev,
+				 "i915 request %llx:%lld freed without being signaled\n",
+				 rq->fence.context, rq->fence.seqno);
+		}
+	}
+
 	kmem_cache_free(global.slab_requests, rq);
 }
 

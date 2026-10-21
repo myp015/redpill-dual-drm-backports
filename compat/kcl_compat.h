@@ -171,12 +171,29 @@ static inline u64 pm_runtime_suspended_time(struct device *dev) { return 0; }
 #define DIV64_U64_ROUND_UP(x, y) div64_u64((x) + (y) - 1, (y))
 #endif
 
-/* --- wait: wake_up_var / wait_var_event_killable (4.19+) --- */
+/* --- wait: wake_up_var / wait_var_event[_killable] (4.13+) --- */
 #include <linux/wait.h>
 #ifndef wake_up_var
-#define wake_up_var(var) wake_up_bit(var, 0)
-#define wait_var_event_killable(var, cond) \
-    wait_on_bit(var, 0, TASK_KILLABLE)
+/*
+ * 4.4 没有 wait_var_event()/wake_up_var()。此前把它们映射到
+ * wait_on_bit()/wake_up_bit() 的 bit 0，语义并不等价：
+ *   - 等待条件退化成 "bit 0 == 0"，被等待的计数为偶数（2/4/6…）时立即
+ *     返回，即便计数非 0。i915 转码时 GT wakeref 正是 4。
+ *   - wake_up_bit() 在 bit 0 已为 0 时直接 return，计数 1→0 这一关键时刻
+ *     反而不会唤醒任何 waiter。
+ * 两者都会让 intel_wakeref_wait_for_idle() 误判 GPU 已空闲（或永远睡死），
+ * 进而在 runtime PM / GPU reset 路径上于仍有活跃引用时关闭电源域。
+ *
+ * 改用 4.4 已导出的 bit_waitqueue()（按地址 hash 的等待队列），由
+ * wait_event*() 循环重查真实条件，语义与 4.13+ 一致。同 hash 的其它
+ * 对象会被一并唤醒，但它们会重查各自的 cond 后继续等待。
+ */
+#define wait_var_event(var, cond)					\
+	wait_event(*bit_waitqueue((void *)(var), 0), (cond))
+#define wait_var_event_killable(var, cond)				\
+	wait_event_killable(*bit_waitqueue((void *)(var), 0), (cond))
+#define wake_up_var(var)						\
+	do { wake_up_all(bit_waitqueue((void *)(var), 0)); } while (0)
 #define init_var_waiter(wq) /* noop */
 #endif
 

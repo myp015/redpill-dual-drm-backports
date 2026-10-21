@@ -54,7 +54,7 @@ struct drm_printer;
 	param(int, disable_power_well, -1) \
 	param(int, enable_ips, 1) \
 	param(int, invert_brightness, 0) \
-	param(int, enable_guc, 2) /* 4.4.302: module_param noop → HuC load only (submission disabled, SA6400 기준) */ \
+	param(int, enable_guc, 0) /* 4.4.302 Task#208：回归 vanilla 默认值。默认加载 HuC 的 2 只对 geminilake QSV 有益，r1000(CFL-S) 上 vcs0 hang 期间先关掉做单变量对照；可用 insmod i915.ko enable_guc=2 恢复 */ \
 	param(int, guc_log_level, -1) \
 	param(char *, guc_firmware_path, NULL) \
 	param(char *, huc_firmware_path, NULL) \

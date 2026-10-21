@@ -22,15 +22,23 @@
  * IN THE SOFTWARE.
  */
 
+#include <linux/moduleparam.h>
+
 #include <drm/drm_print.h>
 
 #include "i915_params.h"
 #include "i915_drv.h"
 
-/* 4.4.302: both module_param_named and MODULE_PARM_DESC fail with Synology kernel.
- * Skip entirely — i915 parameters use compiled-in defaults. */
-#define i915_param_named(name, T, perm, desc)        /* noop */
-#define i915_param_named_unsafe(name, T, perm, desc) /* noop */
+/* 4.4.302：DSM 的 kernel/params.c 与 vanilla 4.4.302 完全一致，且
+ * param_ops_{int,bool,charp,...} 全部 EXPORT_SYMBOL，因此 module_param_named /
+ * MODULE_PARM_DESC 可按 vanilla 5.4 的写法使用。此前整体 noop 只能吃编译期默认值，
+ * 实机上无法对 enable_guc / enable_hangcheck / reset 等做 A/B 对照实验。 */
+#define i915_param_named(name, T, perm, desc) \
+	module_param_named(name, i915_modparams.name, T, perm); \
+	MODULE_PARM_DESC(name, desc)
+#define i915_param_named_unsafe(name, T, perm, desc) \
+	module_param_named_unsafe(name, i915_modparams.name, T, perm); \
+	MODULE_PARM_DESC(name, desc)
 
 struct i915_params i915_modparams __read_mostly = {
 #define MEMBER(T, member, value) .member = (value),

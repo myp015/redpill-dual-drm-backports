@@ -8,6 +8,8 @@
 #include <linux/irq_work.h>
 #include <linux/random.h>
 #include <linux/seqlock.h>
+/* 4.4 的 typecheck 在独立头里（5.x 并入 compiler_types.h） */
+#include <linux/typecheck.h>
 
 #include "i915_pmu.h"
 #include "i915_reg.h"
@@ -248,6 +250,20 @@ static inline void intel_ring_advance(struct i915_request *rq, u32 *cs)
 static inline u32 intel_ring_wrap(const struct intel_ring *ring, u32 pos)
 {
 	return pos & (ring->size - 1);
+}
+
+/*
+ * Task#208：上游 5ba32c7be81e（5.4.23 回合为 19f8fb273193）。
+ * 把环内位置差换算成有符号的"前进/倒退"方向：左移 wrap 位丢掉环号高位，
+ * 只剩符号位有意义的差值，供 execlists_update_context() 判断 RING_TAIL
+ * 是否发生回卷。
+ */
+static inline int intel_ring_direction(const struct intel_ring *ring,
+				       u32 next, u32 prev)
+{
+	typecheck(typeof(ring->size), next);
+	typecheck(typeof(ring->size), prev);
+	return (next - prev) << ring->wrap;
 }
 
 static inline bool

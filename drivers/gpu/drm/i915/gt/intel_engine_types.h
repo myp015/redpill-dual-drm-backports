@@ -107,6 +107,8 @@ struct intel_ring {
 
 	u32 space;
 	u32 size;
+	/* Task#208：intel_ring_direction() 用，见 intel_engine.h */
+	u32 wrap;
 	u32 effective_size;
 };
 

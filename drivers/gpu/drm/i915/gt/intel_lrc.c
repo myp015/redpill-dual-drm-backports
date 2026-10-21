@@ -471,12 +471,6 @@ lrc_descriptor(struct intel_context *ce, struct intel_engine_cs *engine)
 	return desc;
 }
 
-static void unwind_wa_tail(struct i915_request *rq)
-{
-	rq->tail = intel_ring_wrap(rq->ring, rq->wa_tail - WA_TAIL_BYTES);
-	assert_ring_tail_valid(rq->ring, rq->tail);
-}
-
 static struct i915_request *
 __unwind_incomplete_requests(struct intel_engine_cs *engine)
 {
@@ -495,7 +489,6 @@ __unwind_incomplete_requests(struct intel_engine_cs *engine)
 			continue; /* XXX */
 
 		__i915_request_unsubmit(rq);
-		unwind_wa_tail(rq);
 
 		/*
 		 * Push the request back into the queue for later resubmission.
@@ -659,13 +652,35 @@ execlists_schedule_out(struct i915_request *rq)
 	i915_request_put(rq);
 }
 
-static u64 execlists_update_context(const struct i915_request *rq)
+static u64 execlists_update_context(struct i915_request *rq)
 {
 	struct intel_context *ce = rq->hw_context;
-	u64 desc;
+	u64 desc = ce->lrc_desc;
+	u32 tail, prev;
 
-	ce->lrc_reg_state[CTX_RING_TAIL + 1] =
-		intel_ring_set_tail(rq->ring, rq->tail);
+	/*
+	 * Task#208：上游 82c69bf58650（5.4.23 回合为 1e0175a15474）与
+	 * 5ba32c7be81e（5.4.23 回合为 19f8fb273193）。本树是 v5.4.0 基线，
+	 * 两个 Gen9 GPU hang 修复都不在，实测 r1000(CFL-S) 的 vcs0 转码
+	 * 反复 "GPU HANG: ecode 9:4:0x00000000, no progress on vcs0"。
+	 *
+	 * WaIdleLiteRestore:bdw,skl —— 绝不能用同一个 RING_TAIL 提交两次，
+	 * 否则等于提交一个空环，会迷惑硬件。做法是在请求尾部留几个 NOP
+	 * (gen8_emit_wa_tail)，每次重提交都能把 RING_TAIL 往前推。
+	 *
+	 * 但 preempt-to-busy 下请求在 unwind 时仍在硬件上跑，环还活着，
+	 * 不能把 rq->tail 回退到正常结束点（那样会绕回已经提交过的位置），
+	 * 因此让它停在 rq->wa_tail，并在这里比较"新 tail 相对上次提交的
+	 * tail 是否没有前进"：是则强制 context restore，而不是走 lite-restore。
+	 * 上游原判据是 tail == prev；后来发现 timeslicing 也会造成非预期的
+	 * RING_TAIL 回卷（5ba32c7be81e 的 trace 实例），于是改为按方向判断。
+	 */
+	tail = intel_ring_set_tail(rq->ring, rq->tail);
+	prev = ce->lrc_reg_state[CTX_RING_TAIL + 1];
+	if (unlikely(intel_ring_direction(rq->ring, tail, prev) <= 0))
+		desc |= CTX_DESC_FORCE_RESTORE;
+	ce->lrc_reg_state[CTX_RING_TAIL + 1] = tail;
+	rq->tail = rq->wa_tail;
 
 	/*
 	 * Make sure the context image is complete before we submit it to HW.
@@ -684,7 +699,6 @@ static u64 execlists_update_context(const struct i915_request *rq)
 	 */
 	mb();
 
-	desc = ce->lrc_desc;
 	ce->lrc_desc &= ~CTX_DESC_FORCE_RESTORE;
 
 	return desc;
@@ -1112,13 +1126,11 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
 			__unwind_incomplete_requests(engine);
 
 			/*
-			 * If we need to return to the preempted context, we
-			 * need to skip the lite-restore and force it to
-			 * reload the RING_TAIL. Otherwise, the HW has a
-			 * tendency to ignore us rewinding the TAIL to the
-			 * end of an earlier request.
+			 * Task#208：原先在这里无条件置 CTX_DESC_FORCE_RESTORE。
+			 * 上游 82c69bf58650 把它撤掉，改为在
+			 * execlists_update_context() 里按 RING_TAIL 实际是否
+			 * 回卷决定（preempt-to-busy 下 tail 不回退，见那里的说明）。
 			 */
-			last->hw_context->lrc_desc |= CTX_DESC_FORCE_RESTORE;
 			last = NULL;
 		} else if (need_timeslice(engine, last) &&
 			   !timer_pending(&engine->execlists.timer)) {
@@ -1161,14 +1173,11 @@ static void execlists_dequeue(struct intel_engine_cs *engine)
 				return;
 
 			/*
-			 * WaIdleLiteRestore:bdw,skl
-			 * Apply the wa NOOPs to prevent
-			 * ring:HEAD == rq:TAIL as we resubmit the
-			 * request. See gen8_emit_fini_breadcrumb() for
-			 * where we prepare the padding after the
-			 * end of the request.
+			 * Task#208：WaIdleLiteRestore 的 tail 推进已移到
+			 * execlists_update_context()（上游 82c69bf58650）。
+			 * 在这里改 rq->tail 会在 preempt-to-busy 下把环位置
+			 * 绕回已提交处，导致 Gen9 用空环做 lite-restore 而挂死。
 			 */
-			last->tail = last->wa_tail;
 		}
 	}
 

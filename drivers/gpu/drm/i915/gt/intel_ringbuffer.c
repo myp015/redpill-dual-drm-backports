@@ -1312,6 +1312,13 @@ intel_engine_create_ring(struct intel_engine_cs *engine, int size)
 	kref_init(&ring->ref);
 
 	ring->size = size;
+	/*
+	 * Task#208：intel_ring_direction() 需要按环大小归一化的移位量。
+	 * 上游用 BITS_PER_TYPE(ring->size)，但 4.4 内核没有该宏
+	 * （4.20 才随 include/linux/bits.h 引入），这里展开成等价写法。
+	 */
+	ring->wrap = sizeof(ring->size) * BITS_PER_BYTE - ilog2(size);
+
 	/* Workaround an erratum on the i830 which causes a hang if
 	 * the TAIL pointer points to within the last 2 cachelines
 	 * of the buffer.

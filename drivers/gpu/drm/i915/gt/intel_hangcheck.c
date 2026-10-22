@@ -234,11 +234,16 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	struct i915_request *rq, *first = NULL;
 	struct intel_context *ce = NULL;
 	unsigned long flags;
-	u64 lrc_desc = 0;
+	u64 lrc_desc = 0, vm_total = 0;
+	bool vm_4lvl = false;
 	u32 ctx_ggtt = 0;
 	u32 lrc_head = 0, lrc_tail = 0, lrc_start = 0;
+	u32 lrc_cc = 0, lrc_rbc = 0;
 	u32 rq_head = 0, rq_infix = 0, rq_postfix = 0, rq_tail = 0, rq_wa_tail = 0;
 	u32 ring_head = 0, ring_tail = 0, ring_size = 0, ring_eff = 0, ring_wrap = 0;
+	u32 ring_dump[16];
+	bool have_ring = false;
+	int i;
 	u32 ring_start;
 	int count = 0;
 
@@ -284,11 +289,26 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 			if (ce) {
 				lrc_desc = ce->lrc_desc;
 				ctx_ggtt = ce->state ? i915_ggtt_offset(ce->state) : 0;
+				vm_total = ce->vm->total;
+				vm_4lvl = i915_vm_is_4lvl(ce->vm);
 				if (ce->lrc_reg_state) {
 					lrc_head = ce->lrc_reg_state[CTX_RING_HEAD + 1];
 					lrc_tail = ce->lrc_reg_state[CTX_RING_TAIL + 1];
 					lrc_start = ce->lrc_reg_state[CTX_RING_BUFFER_START + 1];
+					lrc_cc = ce->lrc_reg_state[CTX_CONTEXT_CONTROL + 1];
+					lrc_rbc = ce->lrc_reg_state[CTX_RING_BUFFER_CONTROL + 1];
 				}
+			}
+			if (rq->ring && rq->ring->vaddr && rq->ring->size) {
+				u32 mask = rq->ring->size - 1;
+				u32 pos = ring_start & mask;
+
+				pos &= ~3u;
+				for (i = 0; i < ARRAY_SIZE(ring_dump); i++)
+					ring_dump[i] = *(const u32 *)
+						((const u8 *)rq->ring->vaddr +
+						 ((pos + i * 4) & mask));
+				have_ring = true;
 			}
 			rq_head = rq->head;
 			rq_infix = rq->infix;
@@ -328,6 +348,24 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: ring head=%08x tail=%08x size=%08x eff=%08x wrap=%08x\n",
 		 engine->name, ring_head, ring_tail, ring_size, ring_eff, ring_wrap);
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: vm total=%llx 4lvl=%d lrc_cc=%08x lrc_rbc=%08x\n",
+		 engine->name, vm_total, vm_4lvl, lrc_cc, lrc_rbc);
+
+	if (have_ring) {
+		u32 mask = ring_size - 1;
+
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: ring@%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 engine->name, ring_start & mask,
+			 ring_dump[0], ring_dump[1], ring_dump[2], ring_dump[3],
+			 ring_dump[4], ring_dump[5], ring_dump[6], ring_dump[7]);
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: ring@%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 engine->name, (ring_start + 32) & mask,
+			 ring_dump[8], ring_dump[9], ring_dump[10], ring_dump[11],
+			 ring_dump[12], ring_dump[13], ring_dump[14], ring_dump[15]);
+	}
 
 	/* 硬件侧：CSB 与 ELSP 回显（只读，与复位路径无交互） */
 	dev_info(i915->drm.dev,

@@ -371,11 +371,110 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 "hangcheck[%s]: tl seqno=%u hwsp_off=%08x hwsp_ggtt=%08x hwsp_delta=%lld\n",
 		 engine->name, tl_seqno, tl_hwsp_offset, tl_hwsp_ggtt,
 		 tl_hwsp_delta);
+	{
+		struct i915_request *a0 = READ_ONCE(execlists->active[0]);
+		struct i915_request *a1 = READ_ONCE(execlists->active[1]);
+
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: active port0=%p(seqno %u) port1=%p(seqno %u)\n",
+			 engine->name, a0, a0 ? a0->fence.seqno : 0,
+			 a1, a1 ? a1->fence.seqno : 0);
+	}
+
+	/*
+	 * Task#208 第五轮：前四轮已经把 ring 指令流与 context 都排除了，
+	 * 剩下的可能是硬件在用户态 batch（PPGTT 地址）里挂住。这里核对
+	 * context image 里写的 PML4 与软件 ppgtt 根是否一致，并沿页表链
+	 * 查 ACTHD 是否真的映射（取指失败 vs 指令等待）。
+	 */
+	if (ce && ce->vm && ce->vm != &i915->ggtt.vm) {
+		struct i915_ppgtt *ppgtt = i915_vm_to_ppgtt(ce->vm);
+		u64 acthd = lower_32_bits(intel_engine_get_active_head(engine));
+		u64 pml4_dma = px_dma(ppgtt->pd);
+		u64 ctx_pml4 = 0;
+
+		if (ce->lrc_reg_state)
+			ctx_pml4 = ((u64)ce->lrc_reg_state[CTX_PDP0_UDW + 1] << 32) |
+				   ce->lrc_reg_state[CTX_PDP0_LDW + 1];
+
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: ppgtt top=%u pml4_dma=%llx ctx_pml4=%llx %s dma_mask=%llx\n",
+			 engine->name, ce->vm->top,
+			 (unsigned long long)pml4_dma,
+			 (unsigned long long)ctx_pml4,
+			 ctx_pml4 == pml4_dma ? "match" : "MISMATCH",
+			 ce->vm->dma && ce->vm->dma->dma_mask ?
+			 (unsigned long long)*ce->vm->dma->dma_mask : 0ull);
+
+		if (ppgtt->pd->pt.base.page) {
+			const u64 *v = kmap(ppgtt->pd->pt.base.page);
+
+			dev_info(i915->drm.dev,
+				 "hangcheck[%s]: pml4[0..7]=%016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+				 engine->name,
+				 (unsigned long long)v[0], (unsigned long long)v[1],
+				 (unsigned long long)v[2], (unsigned long long)v[3],
+				 (unsigned long long)v[4], (unsigned long long)v[5],
+				 (unsigned long long)v[6], (unsigned long long)v[7]);
+			kunmap(ppgtt->pd->pt.base.page);
+		}
+
+		if (ce->vm->top == 3) {
+			unsigned int i3 = (acthd >> 39) & 511;
+			unsigned int i2 = (acthd >> 30) & 511;
+			unsigned int i1 = (acthd >> 21) & 511;
+			unsigned int i0 = (acthd >> 12) & 511;
+			struct i915_page_directory *pdp, *pd;
+			struct i915_page_table *pt;
+
+			pdp = i915_pd_entry(ppgtt->pd, i3);
+			dev_info(i915->drm.dev,
+				 "hangcheck[%s]: acthd=%llx pml4e[%u]=%p pdp_dma=%llx\n",
+				 engine->name, (unsigned long long)acthd, i3, pdp,
+				 pdp ? (unsigned long long)px_dma(pdp) : 0ull);
+			if (pdp) {
+				pd = i915_pd_entry(pdp, i2);
+				dev_info(i915->drm.dev,
+					 "hangcheck[%s]: pdpe[%u]=%p pd_dma=%llx\n",
+					 engine->name, i2, pd,
+					 pd ? (unsigned long long)px_dma(pd) : 0ull);
+				if (pd) {
+					pt = i915_pt_entry(pd, i1);
+					dev_info(i915->drm.dev,
+						 "hangcheck[%s]: pde[%u]=%p pt_dma=%llx\n",
+						 engine->name, i1, pt,
+						 pt ? (unsigned long long)px_dma(pt) : 0ull);
+					if (pt && pt->base.page) {
+						const u64 *p = kmap(pt->base.page);
+						u64 pte = p[i0];
+
+						dev_info(i915->drm.dev,
+							 "hangcheck[%s]: pte[%u]=%016llx present=%d phys=%llx\n",
+							 engine->name, i0,
+							 (unsigned long long)pte,
+							 (int)(pte & 1),
+							 (unsigned long long)(pte & 0x000ffffffffff000ull));
+						kunmap(pt->base.page);
+					}
+				}
+			}
+		}
+	}
 
 	if (have_ring) {
 		u32 mask = ring_size - 1;
 		u32 hw = hw_head & mask & ~3u;
 		u32 rq = rq_head & mask & ~3u;
+
+		/* ring 前半段：硬件 HEAD 之前的指令流（含本请求的 bb_start 目标） */
+		for (i = 0; i < 0x100; i += 32) {
+			const u32 *s = (const u32 *)((const u8 *)first->ring->vaddr + i);
+
+			dev_info(i915->drm.dev,
+				 "hangcheck[%s]: @%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				 engine->name, i,
+				 s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+		}
 
 		dev_info(i915->drm.dev,
 			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",

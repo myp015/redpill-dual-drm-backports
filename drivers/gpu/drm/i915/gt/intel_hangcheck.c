@@ -235,7 +235,7 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	int count = 0;
 
 	ring_start = ENGINE_READ(engine, RING_START);
-	drm_info(&i915->drm,
+	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: ACTHD=%08x RING_START=%08x HEAD=%08x TAIL=%08x CTL=%08x\n",
 		 engine->name,
 		 lower_32_bits(intel_engine_get_active_head(engine)),
@@ -243,7 +243,7 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 ENGINE_READ(engine, RING_HEAD),
 		 ENGINE_READ(engine, RING_TAIL),
 		 ENGINE_READ(engine, RING_CTL));
-	drm_info(&i915->drm,
+	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: hwsp cpu=%llx ggtt=%08x\n",
 		 engine->name,
 		 (u64)(unsigned long)engine->status_page.addr,
@@ -254,12 +254,12 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		u32 ring = rq->ring ? i915_ggtt_offset(rq->ring->vma) : 0;
 
 		if (count++ >= 8) {
-			drm_info(&i915->drm, "hangcheck[%s]: ... (more)\n",
+			dev_info(i915->drm.dev, "hangcheck[%s]: ... (more)\n",
 				 engine->name);
 			break;
 		}
 
-		drm_info(&i915->drm,
+		dev_info(i915->drm.dev,
 			 "hangcheck[%s]: rq=%p seqno=%u hwsp=%llx:%u signaled=%d started=%d completed=%d ring=%08x match=%d\n",
 			 engine->name, rq,
 			 rq->fence.seqno,
@@ -272,7 +272,7 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	}
 	spin_unlock_irqrestore(&engine->active.lock, flags);
 
-	drm_info(&i915->drm,
+	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: %d active request(s); inflight %p,%p pending %p,%p prio=%d\n",
 		 engine->name, count,
 		 READ_ONCE(engine->execlists.inflight[0]),

@@ -241,19 +241,22 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	u32 lrc_cc = 0, lrc_rbc = 0;
 	u32 rq_head = 0, rq_infix = 0, rq_postfix = 0, rq_tail = 0, rq_wa_tail = 0;
 	u32 ring_head = 0, ring_tail = 0, ring_size = 0, ring_eff = 0, ring_wrap = 0;
-	u32 ring_dump[16];
+	u32 ring_dump[32], req_dump[16];
 	bool have_ring = false;
 	int i;
-	u32 ring_start;
+	u32 ring_start, hw_head;
+	u32 tl_seqno = 0, tl_hwsp_offset = 0, tl_hwsp_ggtt = 0;
+	s64 tl_hwsp_delta = 0;
 	int count = 0;
 
 	ring_start = ENGINE_READ(engine, RING_START);
+	hw_head = ENGINE_READ(engine, RING_HEAD);
 	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: ACTHD=%08x RING_START=%08x HEAD=%08x TAIL=%08x CTL=%08x\n",
 		 engine->name,
 		 lower_32_bits(intel_engine_get_active_head(engine)),
 		 ring_start,
-		 ENGINE_READ(engine, RING_HEAD),
+		 hw_head,
 		 ENGINE_READ(engine, RING_TAIL),
 		 ENGINE_READ(engine, RING_CTL));
 	dev_info(i915->drm.dev,
@@ -301,14 +304,27 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 			}
 			if (rq->ring && rq->ring->vaddr && rq->ring->size) {
 				u32 mask = rq->ring->size - 1;
-				u32 pos = ring_start & mask;
+				u32 pos = hw_head & mask & ~3u;
+				u32 pos2 = rq->head & mask & ~3u;
 
-				pos &= ~3u;
 				for (i = 0; i < ARRAY_SIZE(ring_dump); i++)
 					ring_dump[i] = *(const u32 *)
 						((const u8 *)rq->ring->vaddr +
 						 ((pos + i * 4) & mask));
+				for (i = 0; i < ARRAY_SIZE(req_dump); i++)
+					req_dump[i] = *(const u32 *)
+						((const u8 *)rq->ring->vaddr +
+						 ((pos2 + i * 4) & mask));
 				have_ring = true;
+			}
+			if (rq->timeline) {
+				tl_seqno = rq->timeline->seqno;
+				tl_hwsp_offset = rq->timeline->hwsp_offset;
+				tl_hwsp_ggtt =
+					i915_ggtt_offset(rq->timeline->hwsp_ggtt);
+				tl_hwsp_delta =
+					(s64)(unsigned long)rq->hwsp_seqno -
+					(s64)(unsigned long)rq->timeline->hwsp_seqno;
 			}
 			rq_head = rq->head;
 			rq_infix = rq->infix;
@@ -351,20 +367,46 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: vm total=%llx 4lvl=%d lrc_cc=%08x lrc_rbc=%08x\n",
 		 engine->name, vm_total, vm_4lvl, lrc_cc, lrc_rbc);
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: tl seqno=%u hwsp_off=%08x hwsp_ggtt=%08x hwsp_delta=%lld\n",
+		 engine->name, tl_seqno, tl_hwsp_offset, tl_hwsp_ggtt,
+		 tl_hwsp_delta);
 
 	if (have_ring) {
 		u32 mask = ring_size - 1;
+		u32 hw = hw_head & mask & ~3u;
+		u32 rq = rq_head & mask & ~3u;
 
 		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: ring@%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, ring_start & mask,
+			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 engine->name, hw,
 			 ring_dump[0], ring_dump[1], ring_dump[2], ring_dump[3],
 			 ring_dump[4], ring_dump[5], ring_dump[6], ring_dump[7]);
 		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: ring@%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, (ring_start + 32) & mask,
+			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 engine->name, (hw + 32) & mask,
 			 ring_dump[8], ring_dump[9], ring_dump[10], ring_dump[11],
 			 ring_dump[12], ring_dump[13], ring_dump[14], ring_dump[15]);
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 engine->name, (hw + 64) & mask,
+			 ring_dump[16], ring_dump[17], ring_dump[18], ring_dump[19],
+			 ring_dump[20], ring_dump[21], ring_dump[22], ring_dump[23]);
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 engine->name, (hw + 96) & mask,
+			 ring_dump[24], ring_dump[25], ring_dump[26], ring_dump[27],
+			 ring_dump[28], ring_dump[29], ring_dump[30], ring_dump[31]);
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: @rq%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 engine->name, rq,
+			 req_dump[0], req_dump[1], req_dump[2], req_dump[3],
+			 req_dump[4], req_dump[5], req_dump[6], req_dump[7]);
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: @rq%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 engine->name, (rq + 32) & mask,
+			 req_dump[8], req_dump[9], req_dump[10], req_dump[11],
+			 req_dump[12], req_dump[13], req_dump[14], req_dump[15]);
 	}
 
 	/* 硬件侧：CSB 与 ELSP 回显（只读，与复位路径无交互） */

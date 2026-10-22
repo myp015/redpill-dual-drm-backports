@@ -447,17 +447,78 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 					if (pt && pt->base.page) {
 						const u64 *p = kmap(pt->base.page);
 						u64 pte = p[i0];
+						u64 pte_phys = pte & 0x000ffffffffff000ull;
 
 						dev_info(i915->drm.dev,
 							 "hangcheck[%s]: pte[%u]=%016llx present=%d phys=%llx\n",
 							 engine->name, i0,
 							 (unsigned long long)pte,
 							 (int)(pte & 1),
-							 (unsigned long long)(pte & 0x000ffffffffff000ull));
+							 (unsigned long long)pte_phys);
 						kunmap(pt->base.page);
+
+						/*
+						 * Task#208 第六轮：PTE 已 present ⇒ 不是缺页。
+						 * 直接把 ACTHD 所在页的指令打出来，看硬件停的
+						 * 是 MI_WAIT_FOR_EVENT、MI_SEMAPHORE_WAIT 还是
+						 * 别的媒体指令。
+						 */
+						if ((pte & 1) &&
+						    pfn_valid(pte_phys >> PAGE_SHIFT)) {
+							struct page *bp = pfn_to_page(pte_phys >> PAGE_SHIFT);
+							const u32 *b = kmap(bp);
+							u32 o = (u32)(acthd & ~3u & (PAGE_SIZE - 1));
+							u32 k;
+
+							for (k = 0; k < 4; k++) {
+								u32 base = (o + k * 32) & (PAGE_SIZE - 1);
+
+								dev_info(i915->drm.dev,
+									 "hangcheck[%s]: @batch%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+									 engine->name, base,
+									 b[((base >> 2) + 0) & 1023],
+									 b[((base >> 2) + 1) & 1023],
+									 b[((base >> 2) + 2) & 1023],
+									 b[((base >> 2) + 3) & 1023],
+									 b[((base >> 2) + 4) & 1023],
+									 b[((base >> 2) + 5) & 1023],
+									 b[((base >> 2) + 6) & 1023],
+									 b[((base >> 2) + 7) & 1023]);
+							}
+							kunmap(bp);
+						}
 					}
 				}
 			}
+		}
+	}
+
+	/*
+	 * Task#208 第六轮：HWSP 页里各 timeline 的 seqno（ring 里的
+	 * MI_SEMAPHORE_WAIT 就在等这一页某个 cacheline 的值），以及
+	 * 引擎 status page 的 preempt 地址（fini breadcrumb 结尾的
+	 * busywait 目标，等它归零）。
+	 */
+	if (first && first->hwsp_seqno) {
+		const u32 *h = (const u32 *)
+			((unsigned long)first->hwsp_seqno & PAGE_MASK);
+		const u32 *sp = (const u32 *)engine->status_page.addr;
+		int k;
+
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: hwsp page=%p self=%03x val=%08x preempt_off=%03x preempt=%08x\n",
+			 engine->name, h,
+			 (u32)((unsigned long)first->hwsp_seqno & ~PAGE_MASK),
+			 READ_ONCE(*first->hwsp_seqno),
+			 (u32)I915_GEM_HWS_PREEMPT_ADDR,
+			 sp ? READ_ONCE(sp[I915_GEM_HWS_PREEMPT_ADDR / 4]) : ~0u);
+		for (k = 0; k < 64; k++) {
+			u32 v = READ_ONCE(h[k * 16]);
+
+			if (v)
+				dev_info(i915->drm.dev,
+					 "hangcheck[%s]: hwsp[%03x]=%08x\n",
+					 engine->name, k * 0x40, v);
 		}
 	}
 

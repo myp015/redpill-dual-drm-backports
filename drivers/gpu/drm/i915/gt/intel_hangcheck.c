@@ -25,6 +25,7 @@
 #include "i915_drv.h"
 #include "intel_engine.h"
 #include "intel_gt.h"
+#include "intel_lrc_reg.h"
 #include "intel_reset.h"
 
 struct hangcheck {
@@ -229,8 +230,15 @@ static void hangcheck_accumulate_sample(struct intel_engine_cs *engine,
 static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 {
 	struct drm_i915_private *i915 = engine->i915;
-	struct i915_request *rq;
+	struct intel_engine_execlists * const execlists = &engine->execlists;
+	struct i915_request *rq, *first = NULL;
+	struct intel_context *ce = NULL;
 	unsigned long flags;
+	u64 lrc_desc = 0;
+	u32 ctx_ggtt = 0;
+	u32 lrc_head = 0, lrc_tail = 0, lrc_start = 0;
+	u32 rq_head = 0, rq_infix = 0, rq_postfix = 0, rq_tail = 0, rq_wa_tail = 0;
+	u32 ring_head = 0, ring_tail = 0, ring_size = 0, ring_eff = 0, ring_wrap = 0;
 	u32 ring_start;
 	int count = 0;
 
@@ -269,17 +277,75 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 			 i915_request_started(rq),
 			 i915_request_completed(rq),
 			 ring, ring == ring_start);
+
+		if (!first) {
+			first = rq;
+			ce = rq->hw_context;
+			if (ce) {
+				lrc_desc = ce->lrc_desc;
+				ctx_ggtt = ce->state ? i915_ggtt_offset(ce->state) : 0;
+				if (ce->lrc_reg_state) {
+					lrc_head = ce->lrc_reg_state[CTX_RING_HEAD + 1];
+					lrc_tail = ce->lrc_reg_state[CTX_RING_TAIL + 1];
+					lrc_start = ce->lrc_reg_state[CTX_RING_BUFFER_START + 1];
+				}
+			}
+			rq_head = rq->head;
+			rq_infix = rq->infix;
+			rq_postfix = rq->postfix;
+			rq_tail = rq->tail;
+			rq_wa_tail = rq->wa_tail;
+			if (rq->ring) {
+				ring_head = rq->ring->head;
+				ring_tail = rq->ring->tail;
+				ring_size = rq->ring->size;
+				ring_eff = rq->ring->effective_size;
+				ring_wrap = rq->ring->wrap;
+			}
+		}
 	}
 	spin_unlock_irqrestore(&engine->active.lock, flags);
 
 	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: %d active request(s); inflight %p,%p pending %p,%p prio=%d\n",
 		 engine->name, count,
-		 READ_ONCE(engine->execlists.inflight[0]),
-		 READ_ONCE(engine->execlists.inflight[1]),
-		 READ_ONCE(engine->execlists.pending[0]),
-		 READ_ONCE(engine->execlists.pending[1]),
-		 READ_ONCE(engine->execlists.queue_priority_hint));
+		 READ_ONCE(execlists->inflight[0]),
+		 READ_ONCE(execlists->inflight[1]),
+		 READ_ONCE(execlists->pending[0]),
+		 READ_ONCE(execlists->pending[1]),
+		 READ_ONCE(execlists->queue_priority_hint));
+
+	if (!first)
+		return;
+
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: ce=%p lrc_desc=%016llx ctx_ggtt=%08x lrc_head=%08x lrc_tail=%08x lrc_start=%08x\n",
+		 engine->name, ce, lrc_desc, ctx_ggtt,
+		 lrc_head, lrc_tail, lrc_start);
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: rq head=%08x infix=%08x postfix=%08x tail=%08x wa_tail=%08x\n",
+		 engine->name, rq_head, rq_infix, rq_postfix, rq_tail, rq_wa_tail);
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: ring head=%08x tail=%08x size=%08x eff=%08x wrap=%08x\n",
+		 engine->name, ring_head, ring_tail, ring_size, ring_eff, ring_wrap);
+
+	/* 硬件侧：CSB 与 ELSP 回显（只读，与复位路径无交互） */
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: csb head=%u write=%08x status=%08x %08x %08x %08x\n",
+		 engine->name, execlists->csb_head,
+		 READ_ONCE(*execlists->csb_write),
+		 READ_ONCE(execlists->csb_status[0]),
+		 READ_ONCE(execlists->csb_status[1]),
+		 READ_ONCE(execlists->csb_status[2]),
+		 READ_ONCE(execlists->csb_status[3]));
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: ELSP_STATUS=%08x:%08x ELSP_SQ_CONTENTS=%08x:%08x\n",
+		 engine->name,
+		 ENGINE_READ(engine, RING_EXECLIST_STATUS_HI),
+		 ENGINE_READ(engine, RING_EXECLIST_STATUS_LO),
+		 intel_uncore_read(engine->uncore,
+				   _MMIO(engine->mmio_base + 0x514)),
+		 ENGINE_READ(engine, RING_EXECLIST_SQ_CONTENTS));
 }
 
 static void hangcheck_declare_hang(struct intel_gt *gt,

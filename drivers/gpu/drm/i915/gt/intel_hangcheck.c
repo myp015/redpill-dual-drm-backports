@@ -220,6 +220,68 @@ static void hangcheck_accumulate_sample(struct intel_engine_cs *engine,
 				 I915_ENGINE_WEDGED_TIMEOUT);
 }
 
+/*
+ * Task#208 诊断：vcs0 挂死时 capture 出来的 ecode 恒为 0，根因是
+ * intel_engine_find_active_request() 在 active 队列里一个请求都没选中
+ * （completed / 未 started / match_ring 失配三选一）。这里把每个请求
+ * 的判据原样打出来，首次 hang 才打，避免复位循环刷屏。
+ */
+static void hangcheck_dump_engine(struct intel_engine_cs *engine)
+{
+	struct drm_i915_private *i915 = engine->i915;
+	struct i915_request *rq;
+	unsigned long flags;
+	u32 ring_start;
+	int count = 0;
+
+	ring_start = ENGINE_READ(engine, RING_START);
+	drm_info(&i915->drm,
+		 "hangcheck[%s]: ACTHD=%08x RING_START=%08x HEAD=%08x TAIL=%08x CTL=%08x\n",
+		 engine->name,
+		 lower_32_bits(intel_engine_get_active_head(engine)),
+		 ring_start,
+		 ENGINE_READ(engine, RING_HEAD),
+		 ENGINE_READ(engine, RING_TAIL),
+		 ENGINE_READ(engine, RING_CTL));
+	drm_info(&i915->drm,
+		 "hangcheck[%s]: hwsp cpu=%llx ggtt=%08x\n",
+		 engine->name,
+		 (u64)(unsigned long)engine->status_page.addr,
+		 i915_ggtt_offset(engine->status_page.vma));
+
+	spin_lock_irqsave(&engine->active.lock, flags);
+	list_for_each_entry(rq, &engine->active.requests, sched.link) {
+		u32 ring = rq->ring ? i915_ggtt_offset(rq->ring->vma) : 0;
+
+		if (count++ >= 8) {
+			drm_info(&i915->drm, "hangcheck[%s]: ... (more)\n",
+				 engine->name);
+			break;
+		}
+
+		drm_info(&i915->drm,
+			 "hangcheck[%s]: rq=%p seqno=%u hwsp=%llx:%u signaled=%d started=%d completed=%d ring=%08x match=%d\n",
+			 engine->name, rq,
+			 rq->fence.seqno,
+			 (u64)(unsigned long)rq->hwsp_seqno,
+			 READ_ONCE(*rq->hwsp_seqno),
+			 i915_request_signaled(rq),
+			 i915_request_started(rq),
+			 i915_request_completed(rq),
+			 ring, ring == ring_start);
+	}
+	spin_unlock_irqrestore(&engine->active.lock, flags);
+
+	drm_info(&i915->drm,
+		 "hangcheck[%s]: %d active request(s); inflight %p,%p pending %p,%p prio=%d\n",
+		 engine->name, count,
+		 READ_ONCE(engine->execlists.inflight[0]),
+		 READ_ONCE(engine->execlists.inflight[1]),
+		 READ_ONCE(engine->execlists.pending[0]),
+		 READ_ONCE(engine->execlists.pending[1]),
+		 READ_ONCE(engine->execlists.queue_priority_hint));
+}
+
 static void hangcheck_declare_hang(struct intel_gt *gt,
 				   intel_engine_mask_t hung,
 				   intel_engine_mask_t stuck)
@@ -240,6 +302,11 @@ static void hangcheck_declare_hang(struct intel_gt *gt,
 		len += scnprintf(msg + len, sizeof(msg) - len,
 				 "%s, ", engine->name);
 	msg[len-2] = '\0';
+
+	/* Task#208：只抓首次 hang 的现场，后续复位循环由 first_error 短路 */
+	if (!READ_ONCE(gt->i915->gpu_error.first_error))
+		for_each_engine_masked(engine, gt->i915, hung, tmp)
+			hangcheck_dump_engine(engine);
 
 	return intel_gt_handle_error(gt, hung, I915_ERROR_CAPTURE, "%s", msg);
 }

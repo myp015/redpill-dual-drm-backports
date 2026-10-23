@@ -85,6 +85,9 @@ struct i915_gpu_state {
 
 		/* Software tracked state */
 		bool idle;
+		/* Task#208：本 engine 的采集模式（见 gem_record_rings） */
+		bool candidate;		/* 仅按 RING_START 匹配的未开始请求 */
+		bool no_request;	/* active 链表里没有可关联请求，只记寄存器 */
 		unsigned long hangcheck_timestamp;
 		int num_requests;
 		u32 reset_count;

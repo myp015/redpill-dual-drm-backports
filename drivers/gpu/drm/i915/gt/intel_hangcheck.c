@@ -24,6 +24,7 @@
 
 #include "i915_drv.h"
 #include "intel_engine.h"
+#include "intel_gpu_commands.h"
 #include "intel_gt.h"
 #include "intel_lrc_reg.h"
 #include "intel_reset.h"
@@ -222,6 +223,84 @@ static void hangcheck_accumulate_sample(struct intel_engine_cs *engine,
 }
 
 /*
+ * Task#208：有界打印 HW HEAD..TAIL 之间的 ring 指令窗口。
+ *
+ * ring 由调用者用 intel_ring_get() 保活，因此这里在锁外读取
+ * ring->vaddr / ring->size 是安全的；不携带 request/context 裸指针。
+ * 所有偏移先做边界检查，最多输出 HANGCHECK_RING_DWORDS 个 dword。
+ */
+#define HANGCHECK_RING_DWORDS 64
+
+static void hangcheck_dump_ring(struct intel_engine_cs *engine,
+				const struct intel_ring *ring,
+				u32 head, u32 tail)
+{
+	const u32 *vaddr = READ_ONCE(ring->vaddr);
+	u32 size = READ_ONCE(ring->size);
+	u32 bytes, i;
+
+	if (!vaddr || size < 16 || size % 4 || head % 4 || tail % 4 ||
+	    head >= size || tail > size)
+		return;
+
+	/* HEAD 处的首条命令：区分“跳进 batch”与“停在等待指令” */
+	if (head + 12 <= size) {
+		u32 cmd = vaddr[head >> 2];
+		u32 op = (cmd >> 23) & 0x3f;	/* MI_INSTR opcode */
+
+		if (op == 0x31) {	/* MI_BATCH_BUFFER_START */
+			u64 addr = ((u64)vaddr[(head >> 2) + 2] << 32) |
+				   vaddr[(head >> 2) + 1];
+
+			dev_info(engine->i915->drm.dev,
+				 "hangcheck[%s]: ring[HEAD=%08x] MI_BATCH_BUFFER_START %s addr=%016llx len=%u\n",
+				 engine->name, head,
+				 cmd & MI_BATCH_PPGTT_HSW ? "ppgtt" : "ggtt",
+				 (unsigned long long)addr, cmd & 0xff);
+		} else if (op == 0x1c) {	/* MI_SEMAPHORE_WAIT */
+			dev_info(engine->i915->drm.dev,
+				 "hangcheck[%s]: ring[HEAD=%08x] MI_SEMAPHORE_WAIT %s%s cmp=%08x addr=%08x\n",
+				 engine->name, head,
+				 cmd & MI_SEMAPHORE_GLOBAL_GTT ? "global_gtt " : "",
+				 cmd & MI_SEMAPHORE_POLL ? "poll " : "",
+				 vaddr[(head >> 2) + 1],
+				 vaddr[(head >> 2) + 2]);
+		} else {
+			dev_info(engine->i915->drm.dev,
+				 "hangcheck[%s]: ring[HEAD=%08x] opcode=%02x cmd=%08x\n",
+				 engine->name, head, op, cmd);
+		}
+	}
+
+	if (tail >= head)
+		bytes = tail - head;
+	else
+		bytes = size - head + tail;	/* 已回绕 */
+	if (!bytes)
+		return;
+
+	bytes = min_t(u32, bytes, HANGCHECK_RING_DWORDS * 4);
+	dev_info(engine->i915->drm.dev,
+		 "hangcheck[%s]: ring window head=%08x tail=%08x size=%08x dwords=%u\n",
+		 engine->name, head, tail, size, bytes / 4);
+
+	for (i = 0; i < bytes; i += 8 * 4) {
+		char line[80];
+		char *p = line;
+		u32 off = (head + i) % size;
+		u32 j, n = min_t(u32, 8, (bytes - i) / 4);
+
+		for (j = 0; j < n; j++)
+			p += scnprintf(p, sizeof(line) - (p - line), "%08x ",
+				       vaddr[((off + j * 4) % size) >> 2]);
+
+		dev_info(engine->i915->drm.dev,
+			 "hangcheck[%s]: ring[%08x] %s\n",
+			 engine->name, off, line);
+	}
+}
+
+/*
  * Task#208：采集有界快照。active 链表项只是软件候选，不能证明 ACTHD
  * 对应的硬件执行上下文。
  */
@@ -243,6 +322,7 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	unsigned int count = 0, i;
 	bool more = false;
 	u32 preempt = ~0u;
+	struct intel_ring *ring_dump = NULL;
 
 	acthd = intel_engine_get_active_head(engine);
 	ring_start = ENGINE_READ(engine, RING_START);
@@ -269,6 +349,15 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 			rq_snapshot[count].completed = i915_request_completed(rq);
 			rq_snapshot[count].ring = rq->ring ?
 				i915_ggtt_offset(rq->ring->vma) : 0;
+
+			/*
+			 * Task#208：只有 RING_START 匹配的 ring 才是硬件当前
+			 * 加载的那个。kref 保活后可在锁外安全读取其内容。
+			 */
+			if (!ring_dump && rq->ring &&
+			    rq_snapshot[count].ring == ring_start)
+				ring_dump = intel_ring_get(rq->ring);
+
 			count++;
 		}
 	}
@@ -318,6 +407,11 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 intel_uncore_read(engine->uncore,
 				   _MMIO(engine->mmio_base + 0x514)),
 		 ENGINE_READ(engine, RING_EXECLIST_SQ_CONTENTS));
+
+	if (ring_dump) {
+		hangcheck_dump_ring(engine, ring_dump, hw_head, ring_tail);
+		intel_ring_put(ring_dump);
+	}
 
 	acthd_after = intel_engine_get_active_head(engine);
 	hw_head_after = ENGINE_READ(engine, RING_HEAD);

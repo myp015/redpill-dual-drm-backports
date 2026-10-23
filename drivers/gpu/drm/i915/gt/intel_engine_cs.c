@@ -1536,8 +1536,8 @@ static bool match_ring(struct i915_request *rq)
 	return ring == i915_ggtt_offset(rq->ring->vma);
 }
 
-struct i915_request *
-intel_engine_find_active_request(struct intel_engine_cs *engine)
+static struct i915_request *
+find_request(struct intel_engine_cs *engine, bool require_started)
 {
 	struct i915_request *request, *active = NULL;
 
@@ -1557,7 +1557,7 @@ intel_engine_find_active_request(struct intel_engine_cs *engine)
 		if (i915_request_completed(request))
 			continue;
 
-		if (!i915_request_started(request))
+		if (require_started && !i915_request_started(request))
 			continue;
 
 		/* More than one preemptible request may match! */
@@ -1569,6 +1569,27 @@ intel_engine_find_active_request(struct intel_engine_cs *engine)
 	}
 
 	return active;
+}
+
+struct i915_request *
+intel_engine_find_active_request(struct intel_engine_cs *engine)
+{
+	lockdep_assert_held(&engine->active.lock);
+	return find_request(engine, true);
+}
+
+/*
+ * Task#208：error capture 专用。HW status page 的 seqno 可能滞后，导致真正
+ * 占据 RING_START 的请求被判为 "not started" 而被 find_active_request()
+ * 跳过，于是整份 error state 没有 engine/ring/batch 段。这里只要求
+ * "未完成 + RING_START 匹配" —— 返回的仍是 software candidate，
+ * 不能证明硬件正在执行它。
+ */
+struct i915_request *
+intel_engine_find_hung_request(struct intel_engine_cs *engine)
+{
+	lockdep_assert_held(&engine->active.lock);
+	return find_request(engine, false);
 }
 
 #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)

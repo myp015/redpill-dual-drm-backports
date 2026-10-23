@@ -482,6 +482,10 @@ static void error_print_engine(struct drm_i915_error_state_buf *m,
 	int n;
 
 	err_printf(m, "%s command stream:\n", ee->engine->name);
+	if (ee->no_request)
+		err_printf(m, "  capture: registers only (no request in active list)\n");
+	else if (ee->candidate)
+		err_printf(m, "  capture: candidate request (not started; ring matches RING_START)\n");
 	err_printf(m, "  IDLE?: %s\n", yesno(ee->idle));
 	err_printf(m, "  START: 0x%08x\n", ee->start);
 	err_printf(m, "  HEAD:  0x%08x [0x%08x]\n", ee->head, ee->rq_head);
@@ -544,7 +548,8 @@ static void error_print_engine(struct drm_i915_error_state_buf *m,
 		error_print_request(m, " ", &ee->execlist[n], epoch);
 	}
 
-	error_print_context(m, "  Active context: ", &ee->context);
+	if (!ee->no_request)
+		error_print_context(m, "  Active context: ", &ee->context);
 }
 
 void i915_error_printf(struct drm_i915_error_state_buf *e, const char *f, ...)
@@ -681,11 +686,16 @@ static void __err_print_to_sgl(struct drm_i915_error_state_buf *m,
 		   jiffies_to_msecs(jiffies - error->capture),
 		   jiffies_to_msecs(error->capture - error->epoch));
 
-	for (ee = error->engine; ee; ee = ee->next)
+	for (ee = error->engine; ee; ee = ee->next) {
+		/* Task#208：无请求的 engine 不打印空 context 行 */
+		if (!ee->context.comm[0] && !ee->context.pid)
+			continue;
+
 		err_printf(m, "Active process (on ring %s): %s [%d]\n",
 			   ee->engine->name,
 			   ee->context.comm,
 			   ee->context.pid);
+	}
 
 	err_printf(m, "Reset count: %u\n", error->reset_count);
 	err_printf(m, "Suspend count: %u\n", error->suspend_count);
@@ -1013,6 +1023,23 @@ i915_error_object_create(struct drm_i915_private *i915,
 }
 
 /*
+ * Task#208：现在每个 uabi engine 都会被记录（无请求时只记寄存器），链表头
+ * 不再是“真正挂住的 engine”。ecode 与 ", in comm [pid]" 优先取带请求的节点。
+ */
+static const struct drm_i915_error_engine *
+error_primary_engine(const struct i915_gpu_state *error)
+{
+	const struct drm_i915_error_engine *ee;
+
+	for (ee = error->engine; ee; ee = ee->next) {
+		if (ee->num_requests || ee->candidate)
+			return ee;
+	}
+
+	return error->engine;
+}
+
+/*
  * Generate a semi-unique error code. The code is not meant to have meaning, The
  * code's only purpose is to try to prevent false duplicated bug reports by
  * grossly estimating a GPU error state.
@@ -1024,7 +1051,7 @@ i915_error_object_create(struct drm_i915_private *i915,
  */
 static u32 i915_error_generate_code(struct i915_gpu_state *error)
 {
-	const struct drm_i915_error_engine *ee = error->engine;
+	const struct drm_i915_error_engine *ee = error_primary_engine(error);
 
 	/*
 	 * IPEHR would be an ideal way to detect errors, as it's the gross
@@ -1381,44 +1408,56 @@ gem_record_rings(struct i915_gpu_state *error, struct compress *compress)
 		spin_lock_irqsave(&engine->active.lock, flags);
 		request = intel_engine_find_active_request(engine);
 		if (!request) {
-			spin_unlock_irqrestore(&engine->active.lock, flags);
-			continue;
+			/*
+			 * Task#208：HWSP 滞后会把真正占据 RING_START 的请求
+			 * 判成 not started，导致整份 error state 没有
+			 * engine/ring/batch 段。这里退化为“未完成 +
+			 * RING_START 匹配”的软件候选；它是否就是硬件正在
+			 * 执行的请求不作假设，采集模式会在 error 文件里标明。
+			 */
+			request = intel_engine_find_hung_request(engine);
+			ee->candidate = request != NULL;
 		}
 
-		error->simulated |= record_context(&ee->context, request);
+		if (!request) {
+			/* Task#208：没有可关联请求时仍记录寄存器与 execlist */
+			ee->no_request = true;
+		} else {
+			error->simulated |= record_context(&ee->context, request);
 
-		/*
-		 * We need to copy these to an anonymous buffer
-		 * as the simplest method to avoid being overwritten
-		 * by userspace.
-		 */
-		capture = capture_vma(capture,
-				      request->batch,
-				      &ee->batchbuffer);
-
-		if (HAS_BROKEN_CS_TLB(i915))
+			/*
+			 * We need to copy these to an anonymous buffer
+			 * as the simplest method to avoid being overwritten
+			 * by userspace.
+			 */
 			capture = capture_vma(capture,
-					      engine->gt->scratch,
-					      &ee->wa_batchbuffer);
+					      request->batch,
+					      &ee->batchbuffer);
 
-		capture = request_record_user_bo(request, ee, capture);
+			if (HAS_BROKEN_CS_TLB(i915))
+				capture = capture_vma(capture,
+						      engine->gt->scratch,
+						      &ee->wa_batchbuffer);
 
-		capture = capture_vma(capture,
-				      request->hw_context->state,
-				      &ee->ctx);
+			capture = request_record_user_bo(request, ee, capture);
 
-		capture = capture_vma(capture,
-				      request->ring->vma,
-				      &ee->ringbuffer);
+			capture = capture_vma(capture,
+					      request->hw_context->state,
+					      &ee->ctx);
 
-		ee->cpu_ring_head = request->ring->head;
-		ee->cpu_ring_tail = request->ring->tail;
+			capture = capture_vma(capture,
+					      request->ring->vma,
+					      &ee->ringbuffer);
 
-		ee->rq_head = request->head;
-		ee->rq_post = request->postfix;
-		ee->rq_tail = request->tail;
+			ee->cpu_ring_head = request->ring->head;
+			ee->cpu_ring_tail = request->ring->tail;
 
-		engine_record_requests(engine, request, ee);
+			ee->rq_head = request->head;
+			ee->rq_post = request->postfix;
+			ee->rq_tail = request->tail;
+
+			engine_record_requests(engine, request, ee);
+		}
 		spin_unlock_irqrestore(&engine->active.lock, flags);
 
 		error_record_engine_registers(error, engine, ee);
@@ -1596,19 +1635,21 @@ static const char *
 error_msg(struct i915_gpu_state *error,
 	  intel_engine_mask_t engines, const char *msg)
 {
+	const struct drm_i915_error_engine *ee;
 	int len;
 
 	len = scnprintf(error->error_msg, sizeof(error->error_msg),
 			"GPU HANG: ecode %d:%x:0x%08x",
 			INTEL_GEN(error->i915), engines,
 			i915_error_generate_code(error));
-	if (error->engine) {
+	ee = error_primary_engine(error);
+	if (ee && ee->context.comm[0]) {
 		/* Just show the first executing process, more is confusing */
 		len += scnprintf(error->error_msg + len,
 				 sizeof(error->error_msg) - len,
 				 ", in %s [%d]",
-				 error->engine->context.comm,
-				 error->engine->context.pid);
+				 ee->context.comm,
+				 ee->context.pid);
 	}
 	if (msg)
 		len += scnprintf(error->error_msg + len,

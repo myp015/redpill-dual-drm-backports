@@ -222,357 +222,89 @@ static void hangcheck_accumulate_sample(struct intel_engine_cs *engine,
 }
 
 /*
- * Task#208 诊断：vcs0 挂死时 capture 出来的 ecode 恒为 0，根因是
- * intel_engine_find_active_request() 在 active 队列里一个请求都没选中
- * （completed / 未 started / match_ring 失配三选一）。这里把每个请求
- * 的判据原样打出来，首次 hang 才打，避免复位循环刷屏。
+ * Task#208：采集有界快照。active 链表项只是软件候选，不能证明 ACTHD
+ * 对应的硬件执行上下文。
  */
 static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 {
 	struct drm_i915_private *i915 = engine->i915;
 	struct intel_engine_execlists * const execlists = &engine->execlists;
-	struct i915_request *rq, *first = NULL;
-	struct intel_context *ce = NULL;
+	struct {
+		u64 seqno;
+		u32 hwsp;
+		u32 ring;
+		bool signaled;
+		bool started;
+		bool completed;
+	} rq_snapshot[8];
 	unsigned long flags;
-	u64 lrc_desc = 0, vm_total = 0;
-	bool vm_4lvl = false;
-	u32 ctx_ggtt = 0;
-	u32 lrc_head = 0, lrc_tail = 0, lrc_start = 0;
-	u32 lrc_cc = 0, lrc_rbc = 0;
-	u32 rq_head = 0, rq_infix = 0, rq_postfix = 0, rq_tail = 0, rq_wa_tail = 0;
-	u32 ring_head = 0, ring_tail = 0, ring_size = 0, ring_eff = 0, ring_wrap = 0;
-	u32 ring_dump[32], req_dump[16];
-	bool have_ring = false;
-	int i;
-	u32 ring_start, hw_head;
-	u32 tl_seqno = 0, tl_hwsp_offset = 0, tl_hwsp_ggtt = 0;
-	s64 tl_hwsp_delta = 0;
-	int count = 0;
+	u64 acthd, acthd_after;
+	u32 ring_start, hw_head, ring_tail, ring_ctl, hw_head_after;
+	unsigned int count = 0, i;
+	bool more = false;
+	u32 preempt = ~0u;
 
+	acthd = intel_engine_get_active_head(engine);
 	ring_start = ENGINE_READ(engine, RING_START);
 	hw_head = ENGINE_READ(engine, RING_HEAD);
-	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: ACTHD=%08x RING_START=%08x HEAD=%08x TAIL=%08x CTL=%08x\n",
-		 engine->name,
-		 lower_32_bits(intel_engine_get_active_head(engine)),
-		 ring_start,
-		 hw_head,
-		 ENGINE_READ(engine, RING_TAIL),
-		 ENGINE_READ(engine, RING_CTL));
-	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: hwsp cpu=%llx ggtt=%08x\n",
-		 engine->name,
-		 (u64)(unsigned long)engine->status_page.addr,
-		 i915_ggtt_offset(engine->status_page.vma));
+	ring_tail = ENGINE_READ(engine, RING_TAIL);
+	ring_ctl = ENGINE_READ(engine, RING_CTL);
+	if (engine->status_page.addr)
+		preempt = intel_read_status_page(engine, I915_GEM_HWS_PREEMPT);
 
 	spin_lock_irqsave(&engine->active.lock, flags);
-	list_for_each_entry(rq, &engine->active.requests, sched.link) {
-		u32 ring = rq->ring ? i915_ggtt_offset(rq->ring->vma) : 0;
+	{
+		struct i915_request *rq;
 
-		if (count++ >= 8) {
-			dev_info(i915->drm.dev, "hangcheck[%s]: ... (more)\n",
-				 engine->name);
-			break;
-		}
+		list_for_each_entry(rq, &engine->active.requests, sched.link) {
+			if (count == ARRAY_SIZE(rq_snapshot)) {
+				more = true;
+				break;
+			}
 
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: rq=%p seqno=%u hwsp=%llx:%u signaled=%d started=%d completed=%d ring=%08x match=%d\n",
-			 engine->name, rq,
-			 rq->fence.seqno,
-			 (u64)(unsigned long)rq->hwsp_seqno,
-			 READ_ONCE(*rq->hwsp_seqno),
-			 i915_request_signaled(rq),
-			 i915_request_started(rq),
-			 i915_request_completed(rq),
-			 ring, ring == ring_start);
-
-		if (!first) {
-			first = rq;
-			ce = rq->hw_context;
-			if (ce) {
-				lrc_desc = ce->lrc_desc;
-				ctx_ggtt = ce->state ? i915_ggtt_offset(ce->state) : 0;
-				vm_total = ce->vm->total;
-				vm_4lvl = i915_vm_is_4lvl(ce->vm);
-				if (ce->lrc_reg_state) {
-					lrc_head = ce->lrc_reg_state[CTX_RING_HEAD + 1];
-					lrc_tail = ce->lrc_reg_state[CTX_RING_TAIL + 1];
-					lrc_start = ce->lrc_reg_state[CTX_RING_BUFFER_START + 1];
-					lrc_cc = ce->lrc_reg_state[CTX_CONTEXT_CONTROL + 1];
-					lrc_rbc = ce->lrc_reg_state[CTX_RING_BUFFER_CONTROL + 1];
-				}
-			}
-			if (rq->ring && rq->ring->vaddr && rq->ring->size) {
-				u32 mask = rq->ring->size - 1;
-				u32 pos = hw_head & mask & ~3u;
-				u32 pos2 = rq->head & mask & ~3u;
-
-				for (i = 0; i < ARRAY_SIZE(ring_dump); i++)
-					ring_dump[i] = *(const u32 *)
-						((const u8 *)rq->ring->vaddr +
-						 ((pos + i * 4) & mask));
-				for (i = 0; i < ARRAY_SIZE(req_dump); i++)
-					req_dump[i] = *(const u32 *)
-						((const u8 *)rq->ring->vaddr +
-						 ((pos2 + i * 4) & mask));
-				have_ring = true;
-			}
-			if (rq->timeline) {
-				tl_seqno = rq->timeline->seqno;
-				tl_hwsp_offset = rq->timeline->hwsp_offset;
-				tl_hwsp_ggtt =
-					i915_ggtt_offset(rq->timeline->hwsp_ggtt);
-				tl_hwsp_delta =
-					(s64)(unsigned long)rq->hwsp_seqno -
-					(s64)(unsigned long)rq->timeline->hwsp_seqno;
-			}
-			rq_head = rq->head;
-			rq_infix = rq->infix;
-			rq_postfix = rq->postfix;
-			rq_tail = rq->tail;
-			rq_wa_tail = rq->wa_tail;
-			if (rq->ring) {
-				ring_head = rq->ring->head;
-				ring_tail = rq->ring->tail;
-				ring_size = rq->ring->size;
-				ring_eff = rq->ring->effective_size;
-				ring_wrap = rq->ring->wrap;
-			}
+			rq_snapshot[count].seqno = rq->fence.seqno;
+			rq_snapshot[count].hwsp = hwsp_seqno(rq);
+			rq_snapshot[count].signaled = i915_request_signaled(rq);
+			rq_snapshot[count].started = i915_request_started(rq);
+			rq_snapshot[count].completed = i915_request_completed(rq);
+			rq_snapshot[count].ring = rq->ring ?
+				i915_ggtt_offset(rq->ring->vma) : 0;
+			count++;
 		}
 	}
 	spin_unlock_irqrestore(&engine->active.lock, flags);
 
 	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: %d active request(s); inflight %p,%p pending %p,%p prio=%d\n",
-		 engine->name, count,
-		 READ_ONCE(execlists->inflight[0]),
-		 READ_ONCE(execlists->inflight[1]),
-		 READ_ONCE(execlists->pending[0]),
-		 READ_ONCE(execlists->pending[1]),
+		 "hangcheck[%s]: snapshot ACTHD=%016llx RING_START=%08x HEAD=%08x TAIL=%08x CTL=%08x preempt=%08x\n",
+		 engine->name, (unsigned long long)acthd, ring_start, hw_head,
+		 ring_tail, ring_ctl, preempt);
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: software request candidates shown=%u more=%d ring_match_does_not_prove_execution\n",
+		 engine->name, count, more);
+
+	for (i = 0; i < count; i++) {
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: candidate[%u] seqno=%llu hwsp=%08x signaled=%d started=%d completed=%d ring=%08x ring_match=%d\n",
+			 engine->name, i,
+			 (unsigned long long)rq_snapshot[i].seqno,
+			 rq_snapshot[i].hwsp, rq_snapshot[i].signaled,
+			 rq_snapshot[i].started, rq_snapshot[i].completed,
+			 rq_snapshot[i].ring,
+			 rq_snapshot[i].ring == ring_start);
+	}
+
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: inflight_present=%d,%d pending_present=%d,%d prio=%d\n",
+		 engine->name,
+		 !!READ_ONCE(execlists->inflight[0]),
+		 !!READ_ONCE(execlists->inflight[1]),
+		 !!READ_ONCE(execlists->pending[0]),
+		 !!READ_ONCE(execlists->pending[1]),
 		 READ_ONCE(execlists->queue_priority_hint));
-
-	if (!first)
-		return;
-
 	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: ce=%p lrc_desc=%016llx ctx_ggtt=%08x lrc_head=%08x lrc_tail=%08x lrc_start=%08x\n",
-		 engine->name, ce, lrc_desc, ctx_ggtt,
-		 lrc_head, lrc_tail, lrc_start);
-	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: rq head=%08x infix=%08x postfix=%08x tail=%08x wa_tail=%08x\n",
-		 engine->name, rq_head, rq_infix, rq_postfix, rq_tail, rq_wa_tail);
-	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: ring head=%08x tail=%08x size=%08x eff=%08x wrap=%08x\n",
-		 engine->name, ring_head, ring_tail, ring_size, ring_eff, ring_wrap);
-	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: vm total=%llx 4lvl=%d lrc_cc=%08x lrc_rbc=%08x\n",
-		 engine->name, vm_total, vm_4lvl, lrc_cc, lrc_rbc);
-	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: tl seqno=%u hwsp_off=%08x hwsp_ggtt=%08x hwsp_delta=%lld\n",
-		 engine->name, tl_seqno, tl_hwsp_offset, tl_hwsp_ggtt,
-		 tl_hwsp_delta);
-	{
-		struct i915_request *a0 = READ_ONCE(execlists->active[0]);
-		struct i915_request *a1 = READ_ONCE(execlists->active[1]);
-
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: active port0=%p(seqno %u) port1=%p(seqno %u)\n",
-			 engine->name, a0, a0 ? a0->fence.seqno : 0,
-			 a1, a1 ? a1->fence.seqno : 0);
-	}
-
-	/*
-	 * Task#208 第五轮：前四轮已经把 ring 指令流与 context 都排除了，
-	 * 剩下的可能是硬件在用户态 batch（PPGTT 地址）里挂住。这里核对
-	 * context image 里写的 PML4 与软件 ppgtt 根是否一致，并沿页表链
-	 * 查 ACTHD 是否真的映射（取指失败 vs 指令等待）。
-	 */
-	if (ce && ce->vm && ce->vm != &i915->ggtt.vm) {
-		struct i915_ppgtt *ppgtt = i915_vm_to_ppgtt(ce->vm);
-		u64 acthd = lower_32_bits(intel_engine_get_active_head(engine));
-		u64 pml4_dma = px_dma(ppgtt->pd);
-		u64 ctx_pml4 = 0;
-
-		if (ce->lrc_reg_state)
-			ctx_pml4 = ((u64)ce->lrc_reg_state[CTX_PDP0_UDW + 1] << 32) |
-				   ce->lrc_reg_state[CTX_PDP0_LDW + 1];
-
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: ppgtt top=%u pml4_dma=%llx ctx_pml4=%llx %s dma_mask=%llx\n",
-			 engine->name, ce->vm->top,
-			 (unsigned long long)pml4_dma,
-			 (unsigned long long)ctx_pml4,
-			 ctx_pml4 == pml4_dma ? "match" : "MISMATCH",
-			 ce->vm->dma && ce->vm->dma->dma_mask ?
-			 (unsigned long long)*ce->vm->dma->dma_mask : 0ull);
-
-		if (ppgtt->pd->pt.base.page) {
-			const u64 *v = kmap(ppgtt->pd->pt.base.page);
-
-			dev_info(i915->drm.dev,
-				 "hangcheck[%s]: pml4[0..7]=%016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
-				 engine->name,
-				 (unsigned long long)v[0], (unsigned long long)v[1],
-				 (unsigned long long)v[2], (unsigned long long)v[3],
-				 (unsigned long long)v[4], (unsigned long long)v[5],
-				 (unsigned long long)v[6], (unsigned long long)v[7]);
-			kunmap(ppgtt->pd->pt.base.page);
-		}
-
-		if (ce->vm->top == 3) {
-			unsigned int i3 = (acthd >> 39) & 511;
-			unsigned int i2 = (acthd >> 30) & 511;
-			unsigned int i1 = (acthd >> 21) & 511;
-			unsigned int i0 = (acthd >> 12) & 511;
-			struct i915_page_directory *pdp, *pd;
-			struct i915_page_table *pt;
-
-			pdp = i915_pd_entry(ppgtt->pd, i3);
-			dev_info(i915->drm.dev,
-				 "hangcheck[%s]: acthd=%llx pml4e[%u]=%p pdp_dma=%llx\n",
-				 engine->name, (unsigned long long)acthd, i3, pdp,
-				 pdp ? (unsigned long long)px_dma(pdp) : 0ull);
-			if (pdp) {
-				pd = i915_pd_entry(pdp, i2);
-				dev_info(i915->drm.dev,
-					 "hangcheck[%s]: pdpe[%u]=%p pd_dma=%llx\n",
-					 engine->name, i2, pd,
-					 pd ? (unsigned long long)px_dma(pd) : 0ull);
-				if (pd) {
-					pt = i915_pt_entry(pd, i1);
-					dev_info(i915->drm.dev,
-						 "hangcheck[%s]: pde[%u]=%p pt_dma=%llx\n",
-						 engine->name, i1, pt,
-						 pt ? (unsigned long long)px_dma(pt) : 0ull);
-					if (pt && pt->base.page) {
-						const u64 *p = kmap(pt->base.page);
-						u64 pte = p[i0];
-						u64 pte_phys = pte & 0x000ffffffffff000ull;
-
-						dev_info(i915->drm.dev,
-							 "hangcheck[%s]: pte[%u]=%016llx present=%d phys=%llx\n",
-							 engine->name, i0,
-							 (unsigned long long)pte,
-							 (int)(pte & 1),
-							 (unsigned long long)pte_phys);
-						kunmap(pt->base.page);
-
-						/*
-						 * Task#208 第六轮：PTE 已 present ⇒ 不是缺页。
-						 * 直接把 ACTHD 所在页的指令打出来，看硬件停的
-						 * 是 MI_WAIT_FOR_EVENT、MI_SEMAPHORE_WAIT 还是
-						 * 别的媒体指令。
-						 */
-						if ((pte & 1) &&
-						    pfn_valid(pte_phys >> PAGE_SHIFT)) {
-							struct page *bp = pfn_to_page(pte_phys >> PAGE_SHIFT);
-							const u32 *b = kmap(bp);
-							u32 o = (u32)(acthd & ~3u & (PAGE_SIZE - 1));
-							u32 k;
-
-							for (k = 0; k < 4; k++) {
-								u32 base = (o + k * 32) & (PAGE_SIZE - 1);
-
-								dev_info(i915->drm.dev,
-									 "hangcheck[%s]: @batch%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-									 engine->name, base,
-									 b[((base >> 2) + 0) & 1023],
-									 b[((base >> 2) + 1) & 1023],
-									 b[((base >> 2) + 2) & 1023],
-									 b[((base >> 2) + 3) & 1023],
-									 b[((base >> 2) + 4) & 1023],
-									 b[((base >> 2) + 5) & 1023],
-									 b[((base >> 2) + 6) & 1023],
-									 b[((base >> 2) + 7) & 1023]);
-							}
-							kunmap(bp);
-						}
-					}
-				}
-			}
-		}
-	}
-
-	/*
-	 * Task#208 第六轮：HWSP 页里各 timeline 的 seqno（ring 里的
-	 * MI_SEMAPHORE_WAIT 就在等这一页某个 cacheline 的值），以及
-	 * 引擎 status page 的 preempt 地址（fini breadcrumb 结尾的
-	 * busywait 目标，等它归零）。
-	 */
-	if (first && first->hwsp_seqno) {
-		const u32 *h = (const u32 *)
-			((unsigned long)first->hwsp_seqno & PAGE_MASK);
-		const u32 *sp = (const u32 *)engine->status_page.addr;
-		int k;
-
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: hwsp page=%p self=%03x val=%08x preempt_off=%03x preempt=%08x\n",
-			 engine->name, h,
-			 (u32)((unsigned long)first->hwsp_seqno & ~PAGE_MASK),
-			 READ_ONCE(*first->hwsp_seqno),
-			 (u32)I915_GEM_HWS_PREEMPT_ADDR,
-			 sp ? READ_ONCE(sp[I915_GEM_HWS_PREEMPT_ADDR / 4]) : ~0u);
-		for (k = 0; k < 64; k++) {
-			u32 v = READ_ONCE(h[k * 16]);
-
-			if (v)
-				dev_info(i915->drm.dev,
-					 "hangcheck[%s]: hwsp[%03x]=%08x\n",
-					 engine->name, k * 0x40, v);
-		}
-	}
-
-	if (have_ring) {
-		u32 mask = ring_size - 1;
-		u32 hw = hw_head & mask & ~3u;
-		u32 rq = rq_head & mask & ~3u;
-
-		/* ring 前半段：硬件 HEAD 之前的指令流（含本请求的 bb_start 目标） */
-		for (i = 0; i < 0x100; i += 32) {
-			const u32 *s = (const u32 *)((const u8 *)first->ring->vaddr + i);
-
-			dev_info(i915->drm.dev,
-				 "hangcheck[%s]: @%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-				 engine->name, i,
-				 s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
-		}
-
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, hw,
-			 ring_dump[0], ring_dump[1], ring_dump[2], ring_dump[3],
-			 ring_dump[4], ring_dump[5], ring_dump[6], ring_dump[7]);
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, (hw + 32) & mask,
-			 ring_dump[8], ring_dump[9], ring_dump[10], ring_dump[11],
-			 ring_dump[12], ring_dump[13], ring_dump[14], ring_dump[15]);
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, (hw + 64) & mask,
-			 ring_dump[16], ring_dump[17], ring_dump[18], ring_dump[19],
-			 ring_dump[20], ring_dump[21], ring_dump[22], ring_dump[23]);
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, (hw + 96) & mask,
-			 ring_dump[24], ring_dump[25], ring_dump[26], ring_dump[27],
-			 ring_dump[28], ring_dump[29], ring_dump[30], ring_dump[31]);
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @rq%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, rq,
-			 req_dump[0], req_dump[1], req_dump[2], req_dump[3],
-			 req_dump[4], req_dump[5], req_dump[6], req_dump[7]);
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @rq%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, (rq + 32) & mask,
-			 req_dump[8], req_dump[9], req_dump[10], req_dump[11],
-			 req_dump[12], req_dump[13], req_dump[14], req_dump[15]);
-	}
-
-	/* 硬件侧：CSB 与 ELSP 回显（只读，与复位路径无交互） */
-	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: csb head=%u write=%08x status=%08x %08x %08x %08x\n",
-		 engine->name, execlists->csb_head,
+		 "hangcheck[%s]: hwsp_ggtt=%08x preempt_off=%03x csb head=%u write=%08x status=%08x %08x %08x %08x\n",
+		 engine->name, i915_ggtt_offset(engine->status_page.vma),
+		 (u32)I915_GEM_HWS_PREEMPT_ADDR, execlists->csb_head,
 		 READ_ONCE(*execlists->csb_write),
 		 READ_ONCE(execlists->csb_status[0]),
 		 READ_ONCE(execlists->csb_status[1]),
@@ -586,6 +318,13 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 intel_uncore_read(engine->uncore,
 				   _MMIO(engine->mmio_base + 0x514)),
 		 ENGINE_READ(engine, RING_EXECLIST_SQ_CONTENTS));
+
+	acthd_after = intel_engine_get_active_head(engine);
+	hw_head_after = ENGINE_READ(engine, RING_HEAD);
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: end ACTHD=%016llx HEAD=%08x stable=%d\n",
+		 engine->name, (unsigned long long)acthd_after, hw_head_after,
+		 acthd == acthd_after && hw_head == hw_head_after);
 }
 
 static void hangcheck_declare_hang(struct intel_gt *gt,

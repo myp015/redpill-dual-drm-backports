@@ -32,9 +32,12 @@
 #include <linux/atomic.h>
 #include <linux/firmware.h>
 #include <linux/kref.h>
+#include <linux/moduleparam.h>
 #include <linux/sched/signal.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/thread_info.h>
 #include <linux/wait.h>
 
 #include <drm/drm_debugfs.h>
@@ -44,6 +47,9 @@
 #include "radeon.h"
 #include "radeon_reg.h"
 #include "radeon_trace.h"
+
+/* Task#209 取证桩的前向声明（实现在 radeon_fence_wait_seq_timeout 之前） */
+static void radeon_fence_spy_check(struct radeon_device *rdev, const char *where);
 
 /*
  * Fences
@@ -298,10 +304,12 @@ static void radeon_fence_check_lockup(struct work_struct *work)
 		spin_unlock_irqrestore(&rdev->irq.lock, irqflags);
 	}
 
-	if (radeon_fence_activity(rdev, ring))
+	if (radeon_fence_activity(rdev, ring)) {
+		radeon_fence_spy_check(rdev, "lockup-before-wake");
 		wake_up_all(&rdev->fence_queue);
+		radeon_fence_spy_check(rdev, "lockup-after-wake");
 
-	else if (radeon_ring_is_lockup(rdev, ring, &rdev->ring[ring])) {
+	} else if (radeon_ring_is_lockup(rdev, ring, &rdev->ring[ring])) {
 
 		/* good news we believe it's a lockup */
 		dev_warn(rdev->dev, "GPU lockup (current fence id "
@@ -327,8 +335,11 @@ static void radeon_fence_check_lockup(struct work_struct *work)
  */
 void radeon_fence_process(struct radeon_device *rdev, int ring)
 {
-	if (radeon_fence_activity(rdev, ring))
+	if (radeon_fence_activity(rdev, ring)) {
+		radeon_fence_spy_check(rdev, "process-before-wake");
 		wake_up_all(&rdev->fence_queue);
+		radeon_fence_spy_check(rdev, "process-after-wake");
+	}
 }
 
 /**
@@ -474,6 +485,79 @@ static bool radeon_fence_any_seq_signaled(struct radeon_device *rdev, u64 *seq)
 	return false;
 }
 
+/*
+ * Task#209 回归取证（仅诊断版本，不改变任何行为）
+ *
+ * 现象：4.4.302 实机在 radeon_ib_ring_tests 的 fence 等待路径上，把 radeon
+ * 模块 .text 中 radeon_fence_any_seq_signaled 的指令流写成 8 字节栈地址
+ * （两次开机分别是该函数 +0x4b / +0x4f），随后执行到坏指令 #GP/#PF，
+ * udevd worker 被杀、drm_global_mutex 再不复位。
+ *
+ * 这里在每个等待步骤后做两件事：
+ *   1) 用模块加载时的函数体快照比对 radeon_fence_any_seq_signaled；
+ *   2) 检查 rdev->fence_queue 链表是否挂上了“不在本任务栈上的”等待项
+ *      （栈上等待项被遗留在队列里是野写的主要嫌疑）。
+ * 命中即打印现场与调用栈，只打印一次，避免刷屏。
+ */
+#define RADEON_SPY_LEN	0x60
+static void *radeon_spy_ref;
+static int radeon_spy_hit;
+static unsigned long radeon_spy_last_next;
+static unsigned long radeon_spy_last_prev;
+static int radeon_spy_param = 1;
+module_param_named(t209_spy, radeon_spy_param, int, 0644);
+MODULE_PARM_DESC(t209_spy, "Task#209 fence 野写取证（默认 1）");
+
+static void radeon_fence_spy_check(struct radeon_device *rdev, const char *where)
+{
+	unsigned long fn = (unsigned long)(void *)radeon_fence_any_seq_signaled;
+	struct list_head *head = &rdev->fence_queue.task_list;
+	unsigned long lo, hi, hn, hp;
+
+	if (!radeon_spy_param)
+		return;
+
+	if (radeon_spy_ref && !radeon_spy_hit &&
+	    memcmp((void *)fn, radeon_spy_ref, RADEON_SPY_LEN) != 0) {
+		radeon_spy_hit = 1;
+		pr_err("T209SPY[%s] .text 被改写: fn=%lx pid=%d comm=%s irq=%d\n",
+		       where, fn, current->pid, current->comm, in_interrupt());
+		print_hex_dump(KERN_ERR, "T209SPY ref : ", DUMP_PREFIX_OFFSET, 16, 1,
+			       radeon_spy_ref, RADEON_SPY_LEN, false);
+		print_hex_dump(KERN_ERR, "T209SPY live: ", DUMP_PREFIX_OFFSET, 16, 1,
+			       (void *)fn, RADEON_SPY_LEN, false);
+		dump_stack();
+	}
+
+	if (head->next == head) {
+		radeon_spy_last_next = 0;
+		radeon_spy_last_prev = 0;
+		return;
+	}
+
+	lo = (unsigned long)task_stack_page(current);
+	hi = lo + THREAD_SIZE;
+	hn = (unsigned long)head->next;
+	hp = (unsigned long)head->prev;
+	if (hn == radeon_spy_last_next && hp == radeon_spy_last_prev)
+		return;
+	radeon_spy_last_next = hn;
+	radeon_spy_last_prev = hp;
+
+	pr_err("T209SPY[%s] fence_queue 非空: next=%lx prev=%lx 栈内=%d pid=%d comm=%s irq=%d\n",
+	       where, hn, hp, (hn >= lo && hn < hi), current->pid, current->comm,
+	       in_interrupt());
+}
+
+/* 等待条件包一层，便于在 activity 主动求值后立刻取证 */
+static bool radeon_fence_wait_cond(struct radeon_device *rdev, u64 *seq)
+{
+	bool ret = radeon_fence_any_seq_signaled(rdev, seq) || rdev->needs_reset;
+
+	radeon_fence_spy_check(rdev, "cond");
+	return ret;
+}
+
 /**
  * radeon_fence_wait_seq_timeout - wait for a specific sequence numbers
  *
@@ -498,8 +582,10 @@ static long radeon_fence_wait_seq_timeout(struct radeon_device *rdev,
 	long r;
 	int i;
 
+	radeon_fence_spy_check(rdev, "enter");
 	if (radeon_fence_any_seq_signaled(rdev, target_seq))
 		return timeout;
+	radeon_fence_spy_check(rdev, "post-precheck");
 
 	/* enable IRQs and tracing */
 	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
@@ -521,14 +607,14 @@ static long radeon_fence_wait_seq_timeout(struct radeon_device *rdev,
 				   RADEON_FENCE_WAIT_SLICE_JIFFIES);
 
 		if (intr) {
-			r = wait_event_interruptible_timeout(rdev->fence_queue, (
-				radeon_fence_any_seq_signaled(rdev, target_seq)
-				 || rdev->needs_reset), slice);
+			r = wait_event_interruptible_timeout(rdev->fence_queue,
+				radeon_fence_wait_cond(rdev, target_seq), slice);
 		} else {
-			r = wait_event_timeout(rdev->fence_queue, (
-				radeon_fence_any_seq_signaled(rdev, target_seq)
-				 || rdev->needs_reset), slice);
+			r = wait_event_timeout(rdev->fence_queue,
+				radeon_fence_wait_cond(rdev, target_seq), slice);
 		}
+		radeon_fence_spy_check(rdev, r > 0 ? "post-wait-sig" :
+				       (r < 0 ? "post-wait-intr" : "post-wait-to"));
 
 		if (unlikely(r < 0))
 			break;		/* 被信号打断 */
@@ -540,6 +626,7 @@ static long radeon_fence_wait_seq_timeout(struct radeon_device *rdev,
 		if (radeon_fence_any_seq_signaled(rdev, target_seq) ||
 		    rdev->needs_reset)
 			break;
+		radeon_fence_spy_check(rdev, "post-recheck");
 
 		if (timeout == MAX_SCHEDULE_TIMEOUT)
 			continue;
@@ -865,6 +952,17 @@ int radeon_fence_driver_start_ring(struct radeon_device *rdev, int ring)
 {
 	uint64_t index;
 	int r;
+
+	/* Task#209 取证：在任何 fence 等待之前抓一次函数体快照（含 alternatives 改写后的结果） */
+	if (!radeon_spy_ref && radeon_spy_param) {
+		radeon_spy_ref = kmalloc(RADEON_SPY_LEN, GFP_KERNEL);
+		if (radeon_spy_ref) {
+			memcpy(radeon_spy_ref, (void *)radeon_fence_any_seq_signaled,
+			       RADEON_SPY_LEN);
+			print_hex_dump(KERN_ERR, "T209SPY init: ", DUMP_PREFIX_OFFSET,
+				       16, 1, radeon_spy_ref, RADEON_SPY_LEN, false);
+		}
+	}
 
 	radeon_scratch_free(rdev, rdev->fence_drv[ring].scratch_reg);
 	if (rdev->wb.use_event || !radeon_ring_supports_scratch_reg(rdev, &rdev->ring[ring])) {

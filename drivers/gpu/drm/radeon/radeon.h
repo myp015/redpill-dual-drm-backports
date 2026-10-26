@@ -124,6 +124,13 @@ extern int radeon_cik_support;
  */
 #define RADEON_MAX_USEC_TIMEOUT			100000	/* 100 ms */
 #define RADEON_FENCE_JIFFIES_TIMEOUT		(HZ / 2)
+/*
+ * Task#209：fence 等待的求值分片。TN/ARUBA 的 VCE 环没有 fence 完成中断，
+ * 唯一唤醒源是 lockup_work 的 HZ/2 定时检查，单次长等待会白睡到下一个
+ * tick（实测每帧 504ms）。等待方按本分片重新求值条件（求值时主动读硬件
+ * fence 值），即可把延迟压到一个 tick 以内。
+ */
+#define RADEON_FENCE_WAIT_SLICE_JIFFIES		max_t(long, 1, HZ / 1000)
 #define RADEON_USEC_IB_TEST_TIMEOUT		1000000 /* 1s */
 /* RADEON_IB_POOL_SIZE must be a power of 2 */
 #define RADEON_IB_POOL_SIZE			16

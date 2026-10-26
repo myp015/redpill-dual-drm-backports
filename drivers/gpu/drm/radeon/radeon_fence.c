@@ -510,15 +510,46 @@ static long radeon_fence_wait_seq_timeout(struct radeon_device *rdev,
 		radeon_irq_kms_sw_irq_get(rdev, i);
 	}
 
-	if (intr) {
-		r = wait_event_interruptible_timeout(rdev->fence_queue, (
-			radeon_fence_any_seq_signaled(rdev, target_seq)
-			 || rdev->needs_reset), timeout);
-	} else {
-		r = wait_event_timeout(rdev->fence_queue, (
-			radeon_fence_any_seq_signaled(rdev, target_seq)
-			 || rdev->needs_reset), timeout);
-	}
+	/*
+	 * Task#209：按短分片循环求值。无 fence 中断的环（TN/ARUBA 的 VCE）
+	 * 在两次 lockup_work 之间没有任何唤醒，单次长等待会白睡到下一个
+	 * HZ/2 tick。条件求值本身会主动读硬件 fence 值，分片只是让它有机会
+	 * 被重新求值。
+	 */
+	do {
+		long slice = min_t(long, timeout,
+				   RADEON_FENCE_WAIT_SLICE_JIFFIES);
+
+		if (intr) {
+			r = wait_event_interruptible_timeout(rdev->fence_queue, (
+				radeon_fence_any_seq_signaled(rdev, target_seq)
+				 || rdev->needs_reset), slice);
+		} else {
+			r = wait_event_timeout(rdev->fence_queue, (
+				radeon_fence_any_seq_signaled(rdev, target_seq)
+				 || rdev->needs_reset), slice);
+		}
+
+		if (unlikely(r < 0))
+			break;		/* 被信号打断 */
+
+		if (r > 0)
+			break;		/* 条件已满足 */
+
+		/* 本片刚好用完：主动重求值，覆盖 race */
+		if (radeon_fence_any_seq_signaled(rdev, target_seq) ||
+		    rdev->needs_reset)
+			break;
+
+		if (timeout == MAX_SCHEDULE_TIMEOUT)
+			continue;
+
+		timeout -= slice;
+		if (timeout <= 0) {
+			r = 0;		/* 总超时 */
+			break;
+		}
+	} while (1);
 
 	if (rdev->needs_reset)
 		r = -EDEADLK;
@@ -1089,6 +1120,8 @@ static signed long radeon_fence_default_wait(struct dma_fence *f, bool intr,
 		return t;
 
 	while (t > 0) {
+		long slice, left;
+
 		if (intr)
 			set_current_state(TASK_INTERRUPTIBLE);
 		else
@@ -1106,7 +1139,22 @@ static signed long radeon_fence_default_wait(struct dma_fence *f, bool intr,
 			break;
 		}
 
-		t = schedule_timeout(t);
+		/*
+		 * Task#209：本环没有 fence 完成中断时（TN/ARUBA 的 VCE），
+		 * 只有 lockup_work 的 HZ/2 定时检查会 signal fence。主动推进
+		 * 一次 fence 处理（读硬件 fence 值），再按短分片睡眠，避免
+		 * 每个 fence 固定等满 500ms。
+		 */
+		radeon_fence_process(rdev, fence->ring);
+		if (radeon_test_signaled(fence))
+			break;
+
+		slice = min_t(long, t, RADEON_FENCE_WAIT_SLICE_JIFFIES);
+		left = schedule_timeout(slice);
+
+		/* 只扣除实际睡掉的 jiffies，被回调唤醒时不丢剩余时间 */
+		if (t != MAX_SCHEDULE_TIMEOUT)
+			t -= slice - left;
 
 		if (t > 0 && intr && signal_pending(current))
 			t = -ERESTARTSYS;

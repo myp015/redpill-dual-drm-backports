@@ -213,11 +213,18 @@ int amdgpu_fence_emit_polling(struct amdgpu_ring *ring, uint32_t *s)
  * @ring: pointer to struct amdgpu_ring
  *
  * Start a timer as fallback to our interrupts.
+ *
+ * Task#209：兜底检查改按短分片排（原来是 HZ/2）。本栈不能像 radeon 那样给
+ * fence 换自定义 .wait —— 4.4.302 的 dma_fence_wait_any_timeout() 要求
+ * ops->wait == dma_fence_default_wait，而 amdgpu_cs 的 WAIT_CS 与 amdgpu_sa
+ * 都走该接口。所以改由等待方注册 signaling 时武装这个 timer，再在 timer
+ * 回调里按分片续排（见 amdgpu_fence_fallback），效果等同等待方自己定期
+ * 读一次硬件 seq。timer 只在有等待方时续排，不会变成常驻轮询。
  */
 static void amdgpu_fence_schedule_fallback(struct amdgpu_ring *ring)
 {
 	mod_timer(&ring->fence_drv.fallback_timer,
-		  jiffies + AMDGPU_FENCE_JIFFIES_TIMEOUT);
+		  jiffies + AMDGPU_FENCE_WAIT_SLICE_JIFFIES);
 }
 
 /**
@@ -279,6 +286,44 @@ bool amdgpu_fence_process(struct amdgpu_ring *ring)
 	return true;
 }
 
+/*
+ * Task#209：环上是否还有等待方（见 amdgpu_fence_schedule_fallback 的说明）。
+ *
+ * cb_list 的读取不持 fence->lock：这里只做启发式判断 —— 读到空则本轮不再
+ * 续排，之后新的等待方注册 signaling 时会重新武装 timer；fence 对象由 RCU
+ * 释放，所以用 rcu_read_lock 保证不踩到已释放对象，list_empty 只比较节点
+ * 指针、不解引用等待者。
+ */
+static bool amdgpu_fence_has_waiters(struct amdgpu_ring *ring)
+{
+	struct amdgpu_fence_driver *drv = &ring->fence_drv;
+	u32 last = atomic_read(&drv->last_seq);
+	u32 sync = READ_ONCE(drv->sync_seq);
+	unsigned int n, out;
+
+	if (!drv->fences || last == sync)
+		return false;
+
+	/* 只扫 last_seq+1..sync_seq 之间仍在环上的 fence */
+	out = sync - last;
+	if (out > drv->num_fences_mask + 1)
+		out = drv->num_fences_mask + 1;
+
+	rcu_read_lock();
+	for (n = 1; n <= out; ++n) {
+		struct dma_fence *f;
+
+		f = READ_ONCE(drv->fences[(last + n) & drv->num_fences_mask]);
+		if (f && !list_empty(&f->cb_list)) {
+			rcu_read_unlock();
+			return true;
+		}
+	}
+	rcu_read_unlock();
+
+	return false;
+}
+
 /**
  * amdgpu_fence_fallback - fallback for hardware interrupts
  *
@@ -293,6 +338,14 @@ static void amdgpu_fence_fallback(struct timer_list *t)
 
 	if (amdgpu_fence_process(ring))
 		DRM_WARN("Fence fallback timer expired on ring %s\n", ring->name);
+
+	/*
+	 * Task#209：还有等待方就按短分片继续复查，避免 fence 中断丢失时
+	 * 退化成每个 fence 白等 HZ/2；没有等待方则与原来一致，本次兜底结束
+	 * （下一个等待方注册 signaling 时重新武装）。
+	 */
+	if (amdgpu_fence_has_waiters(ring))
+		amdgpu_fence_schedule_fallback(ring);
 }
 
 /**

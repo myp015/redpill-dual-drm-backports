@@ -38,6 +38,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/thread_info.h>
+#include <linux/uaccess.h>
 #include <linux/wait.h>
 
 #include <drm/drm_debugfs.h>
@@ -486,37 +487,139 @@ static bool radeon_fence_any_seq_signaled(struct radeon_device *rdev, u64 *seq)
 }
 
 /*
- * Task#209 回归取证（仅诊断版本，不改变任何行为）
+ * Task#209 回归取证 v2（仅诊断版本，不改变等待语义）
  *
  * 现象：4.4.302 实机在 radeon_ib_ring_tests 的 fence 等待路径上，把 radeon
- * 模块 .text 中 radeon_fence_any_seq_signaled 的指令流写成 8 字节栈地址
- * （两次开机分别是该函数 +0x4b / +0x4f），随后执行到坏指令 #GP/#PF，
- * udevd worker 被杀、drm_global_mutex 再不复位。
+ * 模块 .text 中 radeon_fence_any_seq_signaled 的 8 字节指令槽写成栈地址
+ * （原版与 Task#209 补丁版都会中，三台构建一致落在 +0x4b：该处正是
+ *  `call radeon_fence_activity` 的返回地址槽），随后执行到坏指令触发
+ * 内核 oops，udevd worker 被杀、drm_global_mutex 再不复位。
  *
- * 这里在每个等待步骤后做两件事：
- *   1) 用模块加载时的函数体快照比对 radeon_fence_any_seq_signaled；
- *   2) 检查 rdev->fence_queue 链表是否挂上了“不在本任务栈上的”等待项
- *      （栈上等待项被遗留在队列里是野写的主要嫌疑）。
- * 命中即打印现场与调用栈，只打印一次，避免刷屏。
+ * 已由 oops 数据反推出的写入特征：写入值 = 某等待项 task_list 的地址
+ * （任务栈上），目标 = 代码地址。这正是 list_add/list_del 在“队列头/
+ * 节点的 next/prev 已被污染成代码地址（例如残留的返回地址）”时的典型表现。
+ *
+ * 因此这里在每个等待检查点做三件事：
+ *   1) 用模块加载时的函数体快照比对 radeon_fence_any_seq_signaled，
+ *      **在真正执行该函数之前**比对，避免先执行坏指令再取证；
+ *   2) 打印 fence_queue 队列头的 next/prev 并按 code/dmap/bad 分类；
+ *   3) 沿队列最多走 8 个节点：节点 base 是否落在当前任务栈内、func 是否落在
+ *      代码段、private 指向的任务 comm、next/prev 的分类，全部用
+ *      probe_kernel_read() 安全读取（坏地址只返回 -EFAULT，不会二次 oops）。
+ * 关键检查点已埋在最可能做链表写的位置两侧：`process-before-wake` /
+ * `process-after-wake`、`lockup-before-wake` / `lockup-after-wake`，
+ * 可以判定野写是否发生在 wake_up_all() 的链表遍历里。
+ * 日志条数上限 RADEON_SPY_LOG_MAX，耗尽后仍继续做 .text 比对。
  */
-#define RADEON_SPY_LEN	0x60
+#define RADEON_SPY_LEN		0x60
+#define RADEON_SPY_LOG_MAX	600
+#define RADEON_SPY_MAX_NODES	8
 static void *radeon_spy_ref;
 static int radeon_spy_hit;
-static unsigned long radeon_spy_last_next;
-static unsigned long radeon_spy_last_prev;
+static int radeon_spy_lines;
 static int radeon_spy_param = 1;
 module_param_named(t209_spy, radeon_spy_param, int, 0644);
 MODULE_PARM_DESC(t209_spy, "Task#209 fence 野写取证（默认 1）");
 
+/*
+ * 一切不可信的指针都用 probe_kernel_read() 读取：它在坏地址上走 fault
+ * fixup 只返回 -EFAULT，不会二次 oops；4.4 的 linux/mm.h 里没有模块可见
+ * 的 pfn_valid() 声明，不能用它做校验。
+ */
+static bool radeon_spy_is_dmap(unsigned long v)
+{
+	return v >= 0xffff880000000000UL && v < 0xffffc80000000000UL;
+}
+
+static const char *radeon_spy_kind(unsigned long v)
+{
+	if (!v)
+		return "nil";
+	if (v >= 0xffffffff80000000UL)
+		return "code";		/* 内核/模块代码段 */
+	if (radeon_spy_is_dmap(v))
+		return "dmap";		/* 直接映射：栈/堆 */
+	return "bad";
+}
+
+/* 等待项的 private 一般是 task_struct*，把 comm 读出来便于认出残留项属于谁 */
+static void radeon_spy_task_comm(unsigned long task, char *out, size_t outlen)
+{
+	char buf[TASK_COMM_LEN];
+
+	out[0] = '\0';
+	if (!radeon_spy_is_dmap(task))
+		return;
+	if (probe_kernel_read(buf, (void *)(task + offsetof(struct task_struct, comm)),
+			      sizeof(buf)))
+		return;
+	buf[sizeof(buf) - 1] = '\0';
+	strncpy(out, buf, outlen - 1);
+	out[outlen - 1] = '\0';
+}
+
+static void radeon_spy_dump_queue(struct radeon_device *rdev, const char *where)
+{
+	struct list_head *head = &rdev->fence_queue.task_list;
+	unsigned long hn = (unsigned long)head->next;
+	unsigned long hp = (unsigned long)head->prev;
+	unsigned long lo = (unsigned long)task_stack_page(current);
+	unsigned long hi = lo + THREAD_SIZE;
+	unsigned long cur;
+	int i;
+
+	if (radeon_spy_lines >= RADEON_SPY_LOG_MAX)
+		return;
+	radeon_spy_lines++;
+
+	pr_err("T209SPY[%s] q=%lx nx=%lx(%s) pv=%lx(%s) pid=%d comm=%s irq=%d\n",
+	       where, (unsigned long)head, hn, radeon_spy_kind(hn),
+	       hp, radeon_spy_kind(hp), current->pid, current->comm,
+	       in_interrupt());
+
+	if (hn == (unsigned long)head && hp == (unsigned long)head)
+		return;			/* 空队列 */
+	if ((hn == (unsigned long)head) != (hp == (unsigned long)head))
+		pr_err("T209SPY[%s] !!! 队列头 next/prev 单边自指\n", where);
+
+	for (i = 0, cur = hn; i < RADEON_SPY_MAX_NODES; i++) {
+		unsigned long base = cur - offsetof(wait_queue_entry_t, task_list);
+		wait_queue_entry_t node;
+		char comm[TASK_COMM_LEN];
+
+		if (cur == (unsigned long)head)
+			break;
+		if (probe_kernel_read(&node, (void *)base, sizeof(node))) {
+			pr_err("T209SPY[%s] !!! 项%d 节点=%lx 不可读（base=%lx）\n",
+			       where, i, cur, base);
+			break;
+		}
+		radeon_spy_task_comm((unsigned long)node.private, comm, sizeof(comm));
+		pr_err("T209SPY[%s]   项%d 节点=%lx base=%lx 本栈=%d fl=%x func=%lx(%s) priv=%lx(%s) next=%lx(%s) prev=%lx(%s)\n",
+		       where, i, cur, base, (base >= lo && base < hi),
+		       node.flags,
+		       (unsigned long)node.func,
+		       radeon_spy_kind((unsigned long)node.func),
+		       (unsigned long)node.private, comm[0] ? comm : "-",
+		       (unsigned long)node.task_list.next,
+		       radeon_spy_kind((unsigned long)node.task_list.next),
+		       (unsigned long)node.task_list.prev,
+		       radeon_spy_kind((unsigned long)node.task_list.prev));
+		if (node.task_list.next == cur ||
+		    node.task_list.next == head)
+			break;		/* 自指或已回到队头，避免绕坏指针打转 */
+		cur = (unsigned long)node.task_list.next;
+	}
+}
+
 static void radeon_fence_spy_check(struct radeon_device *rdev, const char *where)
 {
 	unsigned long fn = (unsigned long)(void *)radeon_fence_any_seq_signaled;
-	struct list_head *head = &rdev->fence_queue.task_list;
-	unsigned long lo, hi, hn, hp;
 
 	if (!radeon_spy_param)
 		return;
 
+	/* .text 快照比对：即便日志配额用尽也必须做 */
 	if (radeon_spy_ref && !radeon_spy_hit &&
 	    memcmp((void *)fn, radeon_spy_ref, RADEON_SPY_LEN) != 0) {
 		radeon_spy_hit = 1;
@@ -529,33 +632,14 @@ static void radeon_fence_spy_check(struct radeon_device *rdev, const char *where
 		dump_stack();
 	}
 
-	if (head->next == head) {
-		radeon_spy_last_next = 0;
-		radeon_spy_last_prev = 0;
-		return;
-	}
-
-	lo = (unsigned long)task_stack_page(current);
-	hi = lo + THREAD_SIZE;
-	hn = (unsigned long)head->next;
-	hp = (unsigned long)head->prev;
-	if (hn == radeon_spy_last_next && hp == radeon_spy_last_prev)
-		return;
-	radeon_spy_last_next = hn;
-	radeon_spy_last_prev = hp;
-
-	pr_err("T209SPY[%s] fence_queue 非空: next=%lx prev=%lx 栈内=%d pid=%d comm=%s irq=%d\n",
-	       where, hn, hp, (hn >= lo && hn < hi), current->pid, current->comm,
-	       in_interrupt());
+	radeon_spy_dump_queue(rdev, where);
 }
 
-/* 等待条件包一层，便于在 activity 主动求值后立刻取证 */
+/* 等待条件包一层：先取证、再执行 any_seq（防止执行已被改写的指令） */
 static bool radeon_fence_wait_cond(struct radeon_device *rdev, u64 *seq)
 {
-	bool ret = radeon_fence_any_seq_signaled(rdev, seq) || rdev->needs_reset;
-
-	radeon_fence_spy_check(rdev, "cond");
-	return ret;
+	radeon_fence_spy_check(rdev, "cond-before");
+	return radeon_fence_any_seq_signaled(rdev, seq) || rdev->needs_reset;
 }
 
 /**

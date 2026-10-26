@@ -320,7 +320,9 @@ static void radeon_fence_check_lockup(struct work_struct *work)
 
 		/* remember that we need an reset */
 		rdev->needs_reset = true;
+		radeon_fence_spy_check(rdev, "lockup-reset-before-wake");
 		wake_up_all(&rdev->fence_queue);
+		radeon_fence_spy_check(rdev, "lockup-reset-after-wake");
 	}
 	up_read(&rdev->exclusive_lock);
 }
@@ -412,8 +414,11 @@ static bool radeon_fence_enable_signaling(struct dma_fence *f)
 	if (down_read_trylock(&rdev->exclusive_lock)) {
 		radeon_irq_kms_sw_irq_get(rdev, fence->ring);
 
-		if (radeon_fence_activity(rdev, fence->ring))
+		if (radeon_fence_activity(rdev, fence->ring)) {
+			radeon_fence_spy_check(rdev, "enable-sig-before-wake");
 			wake_up_all_locked(&rdev->fence_queue);
+			radeon_fence_spy_check(rdev, "enable-sig-after-wake");
+		}
 
 		/* did fence get signaled after we enabled the sw irq? */
 		if (atomic64_read(&rdev->fence_drv[fence->ring].last_seq) >= fence->seq) {

@@ -305,6 +305,8 @@ static void radeon_fence_check_lockup(struct work_struct *work)
 		spin_unlock_irqrestore(&rdev->irq.lock, irqflags);
 	}
 
+	radeon_fence_spy_check(rdev, "lockup-enter");
+
 	if (radeon_fence_activity(rdev, ring)) {
 		radeon_fence_spy_check(rdev, "lockup-before-wake");
 		wake_up_all(&rdev->fence_queue);
@@ -514,14 +516,18 @@ static bool radeon_fence_any_seq_signaled(struct radeon_device *rdev, u64 *seq)
  * 关键检查点已埋在最可能做链表写的位置两侧：`process-before-wake` /
  * `process-after-wake`、`lockup-before-wake` / `lockup-after-wake`，
  * 可以判定野写是否发生在 wake_up_all() 的链表遍历里。
+ * 心跳类检查点（cond-before / post-wait-* / post-recheck / lockup-enter）
+ * 限速到 50ms 一条，建立时间轴又不淹没现场；带 wake 的检查点一律打印。
  * 日志条数上限 RADEON_SPY_LOG_MAX，耗尽后仍继续做 .text 比对。
  */
 #define RADEON_SPY_LEN		0x60
 #define RADEON_SPY_LOG_MAX	600
 #define RADEON_SPY_MAX_NODES	8
+#define RADEON_SPY_HB_MS	50	/* 心跳类检查点限速：每 50ms 最多一条 */
 static void *radeon_spy_ref;
 static int radeon_spy_hit;
 static int radeon_spy_lines;
+static unsigned long radeon_spy_last_hb;
 static int radeon_spy_param = 1;
 module_param_named(t209_spy, radeon_spy_param, int, 0644);
 MODULE_PARM_DESC(t209_spy, "Task#209 fence 野写取证（默认 1）");
@@ -636,6 +642,17 @@ static void radeon_fence_spy_check(struct radeon_device *rdev, const char *where
 			       (void *)fn, RADEON_SPY_LEN, false);
 		dump_stack();
 	}
+
+	/*
+	 * 分片等待每秒会走几百次心跳检查点，全部打印会淹没现场并耗光日志配额，
+	 * 因此对心跳类检查点限速到 50ms 一条；凡是名字里带 wake 的唤醒路径
+	 * 检查点一律打印，它们是定位野写发生窗口的关键。
+	 */
+	if (!strstr(where, "wake") &&
+	    time_before(jiffies,
+			radeon_spy_last_hb + msecs_to_jiffies(RADEON_SPY_HB_MS)))
+		return;
+	radeon_spy_last_hb = jiffies;
 
 	radeon_spy_dump_queue(rdev, where);
 }

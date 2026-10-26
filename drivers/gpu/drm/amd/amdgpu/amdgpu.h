@@ -181,6 +181,13 @@ extern int amdgpu_cik_support;
 #define AMDGPU_WAIT_IDLE_TIMEOUT_IN_MS	        3000
 #define AMDGPU_MAX_USEC_TIMEOUT			100000	/* 100 ms */
 #define AMDGPU_FENCE_JIFFIES_TIMEOUT		(HZ / 2)
+/*
+ * Task#209：fence 等待的求值分片（与 radeon 侧同构）。各 IP 的 IH 正常都会
+ * 逐 ring 调 amdgpu_fence_process()，但 fence 中断一旦丢失/被屏蔽，唯一兜底
+ * 是 ring 的 fallback_timer（HZ/2），单次长等待会白睡到该 timer 到期。
+ * 等待方按本分片重新读一次硬件 seq，即可把延迟压到一个 tick 以内。
+ */
+#define AMDGPU_FENCE_WAIT_SLICE_JIFFIES		max_t(long, 1, HZ / 1000)
 /* AMDGPU_IB_POOL_SIZE must be a power of 2 */
 #define AMDGPU_IB_POOL_SIZE			16
 #define AMDGPU_DEBUGFS_MAX_COMPONENTS		32

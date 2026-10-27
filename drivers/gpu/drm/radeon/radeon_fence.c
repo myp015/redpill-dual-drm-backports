@@ -31,6 +31,7 @@
 
 #include <linux/atomic.h>
 #include <linux/firmware.h>
+#include <linux/hw_breakpoint.h>
 #include <linux/kref.h>
 #include <linux/moduleparam.h>
 #include <linux/sched/signal.h>
@@ -40,6 +41,9 @@
 #include <linux/thread_info.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+
+#include <asm/pgtable.h>
+#include <asm/ptrace.h>
 
 #include <drm/drm_debugfs.h>
 #include <drm/drm_device.h>
@@ -533,6 +537,213 @@ module_param_named(t209_spy, radeon_spy_param, int, 0644);
 MODULE_PARM_DESC(t209_spy, "Task#209 fence 野写取证（默认 1）");
 
 /*
+ * Task#209 第二轮取证：写断点。
+ *
+ * 采样式检查点只能证明「野写发生在哪个窗口」，无法指出「谁写的」。这里改用
+ * x86 调试寄存器在野写目标上挂 W 型硬件断点（DR0-DR3，全 CPU 生效）：任何
+ * 上下文对该地址的写都会触发 #DB，处理器把写入指令之后的 RIP 与当时的寄存
+ * 器、当前内核栈一并交给我们，于是可以直接读出写入者是谁。
+ *
+ * 目标地址是 radeon_fence_any_seq_signaled 里 `call radeon_fence_activity`
+ * 的返回地址槽（实测在 +0x4B），被写坏的就是这 8 字节。x86 的 LEN=8 数据断点
+ * 要求地址对齐，该地址未对齐，因此改用 4 字节窗口覆盖其高 4 字节：
+ * 任何覆盖该槽的 4/8 字节写都会与窗口重叠而被命中。
+ *
+ * 野写也可能走直接映射别名（模块 .text 的物理页在 PAGE_OFFSET 处的映射），
+ * 硬件断点比较的是线性地址，所以同时在别名上挂同样的断点。
+ */
+#define RADEON_SPY_BP_MAX	32
+#define RADEON_SPY_BP_FRAMES	8
+
+struct radeon_spy_bp_rec {
+	unsigned long ip;	/* 命中后的 RIP（写入指令的下一条） */
+	unsigned long sp;
+	unsigned long bp;
+	unsigned long ax, bx, cx, dx, si, di;
+	unsigned long frame[RADEON_SPY_BP_FRAMES];
+	int pid;
+	int cpu;
+	char comm[TASK_COMM_LEN];
+};
+
+static struct radeon_spy_bp_rec radeon_spy_bp[RADEON_SPY_BP_MAX];
+static atomic_t radeon_spy_bp_cnt = ATOMIC_INIT(0);
+static int radeon_spy_bp_printed;
+static struct perf_event * __percpu *radeon_spy_bp_ev[2];
+static int radeon_spy_bp_tried;
+static int radeon_spy_bp_param = 1;
+module_param_named(t209_bp, radeon_spy_bp_param, int, 0644);
+MODULE_PARM_DESC(t209_bp, "Task#209 野写硬件写断点取证（默认 1）");
+
+/* 沿帧指针链抓调用者返回地址；只走当前任务自己的内核栈，越界即停 */
+static void radeon_spy_bp_walk(struct radeon_spy_bp_rec *r, unsigned long fp)
+{
+	unsigned long lo = (unsigned long)task_stack_page(current);
+	unsigned long hi = lo + THREAD_SIZE;
+	int i;
+
+	for (i = 0; i < RADEON_SPY_BP_FRAMES; i++) {
+		unsigned long next, ret;
+
+		if (fp < lo || fp + 16 > hi || (fp & 7))
+			break;
+		next = *(unsigned long *)fp;
+		ret = *(unsigned long *)(fp + 8);
+		r->frame[i] = ret;
+		if (next <= fp)
+			break;
+		fp = next;
+	}
+}
+
+/* #DB 上下文：只记录，不打印（printk 在异常上下文里有死锁风险） */
+static void radeon_spy_bp_handler(struct perf_event *bp,
+				  struct perf_sample_data *data,
+				  struct pt_regs *regs)
+{
+	int idx = atomic_inc_return(&radeon_spy_bp_cnt) - 1;
+	struct radeon_spy_bp_rec *r;
+
+	if (idx >= RADEON_SPY_BP_MAX)
+		return;
+	r = &radeon_spy_bp[idx];
+	r->ip = instruction_pointer(regs);
+	r->sp = regs->sp;
+	r->bp = regs->bp;
+	r->ax = regs->ax;
+	r->bx = regs->bx;
+	r->cx = regs->cx;
+	r->dx = regs->dx;
+	r->si = regs->si;
+	r->di = regs->di;
+	r->pid = current->pid;
+	r->cpu = smp_processor_id();
+	memcpy(r->comm, current->comm, TASK_COMM_LEN);
+	radeon_spy_bp_walk(r, regs->bp);
+}
+
+/* 进程上下文（检查点）里把尚未打印的记录打出来 */
+static void radeon_spy_bp_dump(void)
+{
+	int n = atomic_read(&radeon_spy_bp_cnt);
+	int i, j;
+
+	if (n > RADEON_SPY_BP_MAX)
+		n = RADEON_SPY_BP_MAX;
+	for (i = radeon_spy_bp_printed; i < n; i++) {
+		struct radeon_spy_bp_rec *r = &radeon_spy_bp[i];
+
+		pr_err("T209BP[%d] ip=%pS sp=%lx bp=%lx ax=%lx bx=%lx cx=%lx dx=%lx si=%lx di=%lx cpu=%d pid=%d comm=%s\n",
+		       i, (void *)r->ip, r->sp, r->bp, r->ax, r->bx,
+		       r->cx, r->dx, r->si, r->di, r->cpu, r->pid, r->comm);
+		for (j = 0; j < RADEON_SPY_BP_FRAMES && r->frame[j]; j++)
+			pr_err("T209BP[%d]   调用者%d=%pS(%lx)\n",
+			       i, j, (void *)r->frame[j], r->frame[j]);
+	}
+	radeon_spy_bp_printed = n;
+}
+
+static void radeon_spy_bp_install_one(int slot, unsigned long addr)
+{
+	struct perf_event_attr attr;
+
+	if (radeon_spy_bp_ev[slot])
+		return;
+	hw_breakpoint_init(&attr);
+	attr.bp_addr = addr;
+	attr.bp_len = HW_BREAKPOINT_LEN_4;
+	attr.bp_type = HW_BREAKPOINT_W;
+	radeon_spy_bp_ev[slot] = register_wide_hw_breakpoint(&attr,
+							     radeon_spy_bp_handler,
+							     NULL);
+	if (IS_ERR_OR_NULL(radeon_spy_bp_ev[slot])) {
+		long err = IS_ERR(radeon_spy_bp_ev[slot]) ?
+			   PTR_ERR(radeon_spy_bp_ev[slot]) : -ENOSYS;
+
+		pr_err("T209BP 断点%d 注册失败 addr=%lx err=%ld\n", slot, addr, err);
+		radeon_spy_bp_ev[slot] = NULL;
+		return;
+	}
+	pr_err("T209BP 断点%d 已挂 addr=%lx\n", slot, addr);
+}
+
+/*
+ * 野写打中的是 any_seq_signaled 里 `call radeon_fence_activity` 的返回地址槽。
+ * 偏移不写死：在函数体里找那条目标为 radeon_fence_activity 的 e8 相对调用，
+ * 返回地址的偏移就是它的位置+5。这样编译器改动不会让断点挂错地方。
+ */
+static unsigned long radeon_spy_bp_find_off(unsigned long fn)
+{
+	const unsigned char *p = (const unsigned char *)fn;
+	int i;
+
+	for (i = 0; i + 5 <= RADEON_SPY_LEN; i++) {
+		s32 rel;
+
+		if (p[i] != 0xe8)
+			continue;
+		memcpy(&rel, p + i + 1, sizeof(rel));
+		if (fn + i + 5 + rel ==
+		    (unsigned long)(void *)radeon_fence_activity)
+			return i + 5;
+	}
+	return 0;
+}
+
+/*
+ * 在野写目标上挂写断点。窗口取目标地址之后第一个 4 字节对齐处：
+ * 野写要覆盖那 8 字节返回地址槽，必然与该窗口重叠。
+ */
+static void radeon_spy_bp_install(void)
+{
+	unsigned long fn = (unsigned long)(void *)radeon_fence_any_seq_signaled;
+	unsigned long off = radeon_spy_bp_find_off(fn);
+	unsigned long tgt = fn + off;
+	unsigned long win;
+	unsigned int level = 0;
+	pte_t *pte;
+
+	if (!radeon_spy_bp_param || radeon_spy_bp_tried)
+		return;
+	radeon_spy_bp_tried = 1;
+
+	if (!off) {
+		pr_err("T209BP 未能在 any_seq_signaled 里找到目标调用，放弃挂断点\n");
+		return;
+	}
+	win = (tgt + 4) & ~3UL;
+	pr_err("T209BP 目标 fn=%lx off=%lx tgt=%lx window=%lx\n",
+	       fn, off, tgt, win);
+
+	radeon_spy_bp_install_one(0, win);
+
+	/* 同一物理页在直接映射里的别名：野写也可能从别名的线性地址打进来 */
+	pte = lookup_address(win & PAGE_MASK, &level);
+	if (pte && (pte_val(*pte) & _PAGE_PRESENT)) {
+		unsigned long pa = (unsigned long)pte_val(*pte) & PTE_PFN_MASK;
+		unsigned long alias = (unsigned long)__va(pa) +
+				      (win & ~PAGE_MASK);
+
+		radeon_spy_bp_install_one(1, alias);
+	} else {
+		pr_err("T209BP 别名解析失败 win=%lx pte=%p level=%u\n",
+		       win, pte, level);
+	}
+}
+
+static void radeon_spy_bp_remove(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(radeon_spy_bp_ev); i++) {
+		if (!radeon_spy_bp_ev[i])
+			continue;
+		unregister_wide_hw_breakpoint(radeon_spy_bp_ev[i]);
+		radeon_spy_bp_ev[i] = NULL;
+	}
+}
+
+/*
  * 一切不可信的指针都用 probe_kernel_read() 读取：它在坏地址上走 fault
  * fixup 只返回 -EFAULT，不会二次 oops；4.4 的 linux/mm.h 里没有模块可见
  * 的 pfn_valid() 声明，不能用它做校验。
@@ -627,6 +838,9 @@ static void radeon_fence_spy_check(struct radeon_device *rdev, const char *where
 {
 	unsigned long fn = (unsigned long)(void *)radeon_fence_any_seq_signaled;
 
+	/* 写断点先出结果：任何上下文命中过就立刻打印 */
+	radeon_spy_bp_dump();
+
 	if (!radeon_spy_param)
 		return;
 
@@ -660,8 +874,13 @@ static void radeon_fence_spy_check(struct radeon_device *rdev, const char *where
 /* 等待条件包一层：先取证、再执行 any_seq（防止执行已被改写的指令） */
 static bool radeon_fence_wait_cond(struct radeon_device *rdev, u64 *seq)
 {
+	bool signaled;
+
 	radeon_fence_spy_check(rdev, "cond-before");
-	return radeon_fence_any_seq_signaled(rdev, seq) || rdev->needs_reset;
+	signaled = radeon_fence_any_seq_signaled(rdev, seq) || rdev->needs_reset;
+	/* 把野写窗口再切一刀：any_seq 返回后立刻复核 .text */
+	radeon_fence_spy_check(rdev, "cond-after");
+	return signaled;
 }
 
 /**
@@ -1059,6 +1278,9 @@ int radeon_fence_driver_start_ring(struct radeon_device *rdev, int ring)
 	uint64_t index;
 	int r;
 
+	/* Task#209 取证：写断点要在任何 fence 等待之前挂好（内部只尝试一次） */
+	radeon_spy_bp_install();
+
 	/* Task#209 取证：在任何 fence 等待之前抓一次函数体快照（含 alternatives 改写后的结果） */
 	if (!radeon_spy_ref && radeon_spy_param) {
 		radeon_spy_ref = kmalloc(RADEON_SPY_LEN, GFP_KERNEL);
@@ -1168,6 +1390,9 @@ int radeon_fence_driver_init(struct radeon_device *rdev)
 void radeon_fence_driver_fini(struct radeon_device *rdev)
 {
 	int ring, r;
+
+	/* 卸驱动前必须撤掉写断点，否则断点会指向已释放的模块代码 */
+	radeon_spy_bp_remove();
 
 	mutex_lock(&rdev->ring_lock);
 	for (ring = 0; ring < RADEON_NUM_RINGS; ring++) {

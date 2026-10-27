@@ -227,27 +227,77 @@ static void hangcheck_accumulate_sample(struct intel_engine_cs *engine,
  * （completed / 未 started / match_ring 失配三选一）。这里把每个请求
  * 的判据原样打出来，首次 hang 才打，避免复位循环刷屏。
  */
+/* Task#208 第九轮：把"取哪个请求"和"采样它的哪些字段"分开。
+ * 硬件真正在跑的请求可能不在 active.requests 里（preempt-to-busy 已把它
+ * unwind 回 priolist），必须能从 execlists->active 槽单独采样。
+ */
+struct hangcheck_sample {
+	struct i915_request *rq;
+	struct intel_context *ce;
+	u64 lrc_desc, vm_total;
+	bool vm_4lvl;
+	u32 ctx_ggtt, ring_ggtt;
+	u32 lrc_head, lrc_tail, lrc_start, lrc_cc, lrc_rbc;
+	u32 rq_head, rq_infix, rq_postfix, rq_tail, rq_wa_tail;
+	u32 ring_head, ring_tail, ring_size, ring_eff, ring_wrap;
+	u32 tl_seqno, tl_hwsp_offset, tl_hwsp_ggtt;
+	s64 tl_hwsp_delta;
+};
+
+static void
+hangcheck_sample_request(struct i915_request *rq, struct hangcheck_sample *s)
+{
+	memset(s, 0, sizeof(*s));
+	s->rq = rq;
+	s->ce = rq->hw_context;
+	if (s->ce) {
+		s->lrc_desc = s->ce->lrc_desc;
+		s->ctx_ggtt = s->ce->state ? i915_ggtt_offset(s->ce->state) : 0;
+		s->vm_total = s->ce->vm->total;
+		s->vm_4lvl = i915_vm_is_4lvl(s->ce->vm);
+		if (s->ce->lrc_reg_state) {
+			s->lrc_head = s->ce->lrc_reg_state[CTX_RING_HEAD + 1];
+			s->lrc_tail = s->ce->lrc_reg_state[CTX_RING_TAIL + 1];
+			s->lrc_start = s->ce->lrc_reg_state[CTX_RING_BUFFER_START + 1];
+			s->lrc_cc = s->ce->lrc_reg_state[CTX_CONTEXT_CONTROL + 1];
+			s->lrc_rbc = s->ce->lrc_reg_state[CTX_RING_BUFFER_CONTROL + 1];
+		}
+	}
+	if (rq->ring) {
+		s->ring_ggtt = i915_ggtt_offset(rq->ring->vma);
+		s->ring_head = rq->ring->head;
+		s->ring_tail = rq->ring->tail;
+		s->ring_size = rq->ring->size;
+		s->ring_eff = rq->ring->effective_size;
+		s->ring_wrap = rq->ring->wrap;
+	}
+	if (rq->timeline) {
+		s->tl_seqno = rq->timeline->seqno;
+		s->tl_hwsp_offset = rq->timeline->hwsp_offset;
+		s->tl_hwsp_ggtt = i915_ggtt_offset(rq->timeline->hwsp_ggtt);
+		s->tl_hwsp_delta = (s64)(unsigned long)rq->hwsp_seqno -
+				   (s64)(unsigned long)rq->timeline->hwsp_seqno;
+	}
+	s->rq_head = rq->head;
+	s->rq_infix = rq->infix;
+	s->rq_postfix = rq->postfix;
+	s->rq_tail = rq->tail;
+	s->rq_wa_tail = rq->wa_tail;
+}
+
 static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 {
 	struct drm_i915_private *i915 = engine->i915;
 	struct intel_engine_execlists * const execlists = &engine->execlists;
-	struct i915_request *rq, *first = NULL;
-	struct intel_context *ce = NULL;
+	struct i915_request *rq, *first = NULL, *inflight = NULL;
+	struct hangcheck_sample sample;
 	unsigned long flags;
-	u64 lrc_desc = 0, vm_total = 0;
-	bool vm_4lvl = false;
-	u32 ctx_ggtt = 0;
-	u32 lrc_head = 0, lrc_tail = 0, lrc_start = 0;
-	u32 lrc_cc = 0, lrc_rbc = 0;
-	u32 rq_head = 0, rq_infix = 0, rq_postfix = 0, rq_tail = 0, rq_wa_tail = 0;
-	u32 ring_head = 0, ring_tail = 0, ring_size = 0, ring_eff = 0, ring_wrap = 0;
 	u32 ring_dump[32], req_dump[16];
-	bool have_ring = false;
 	int i;
 	u32 ring_start, hw_head;
-	u32 tl_seqno = 0, tl_hwsp_offset = 0, tl_hwsp_ggtt = 0;
-	s64 tl_hwsp_delta = 0;
 	int count = 0;
+
+	memset(&sample, 0, sizeof(sample));
 
 	ring_start = ENGINE_READ(engine, RING_START);
 	hw_head = ENGINE_READ(engine, RING_HEAD);
@@ -265,9 +315,37 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 (u64)(unsigned long)engine->status_page.addr,
 		 i915_ggtt_offset(engine->status_page.vma));
 
+	/*
+	 * Task#208 第九轮：preempt-to-busy 下，正在硬件上执行的请求会被
+	 * __unwind_incomplete_requests() 移回 priolist（intel_lrc.c:509），
+	 * 不再出现在 active.requests 里。必须以 execlists->active 槽为取样对象，
+	 * 否则 ring / PPGTT / batch 全读到错误的 context（第八阶段实测：
+	 * rcs0 用 seqno 6 的 ring 0x1d6000，而硬件在跑 seqno 14 的 0x7f2000）。
+	 *
+	 * 这里不调 execlists_active()：它带 GEM_BUG_ON(active - inflight >
+	 * num_ports)，hang 现场 active 可能已越过哨兵。锁序：tasklet lock 必须
+	 * 先于 active.lock 取得/释放，不能嵌套在它里面。
+	 */
+	execlists_active_lock_bh(execlists);
+	inflight = READ_ONCE(*execlists->active);
+	if (inflight)
+		i915_request_get(inflight);
+	execlists_active_unlock_bh(execlists);
+
+	if (inflight && !i915_request_completed(inflight)) {
+		first = inflight;
+		hangcheck_sample_request(first, &sample);
+		dev_info(i915->drm.dev,
+			 "hangcheck[%s]: sample=inflight rq=%p seqno=%u ring=%08x\n",
+			 engine->name, first, first->fence.seqno, sample.ring_ggtt);
+	}
+
 	spin_lock_irqsave(&engine->active.lock, flags);
 	list_for_each_entry(rq, &engine->active.requests, sched.link) {
 		u32 ring = rq->ring ? i915_ggtt_offset(rq->ring->vma) : 0;
+		u32 off = rq->timeline ? rq->timeline->hwsp_offset : 0;
+		u32 ggtt = rq->timeline ?
+			i915_ggtt_offset(rq->timeline->hwsp_ggtt) : 0;
 
 		if (count++ >= 8) {
 			dev_info(i915->drm.dev, "hangcheck[%s]: ... (more)\n",
@@ -275,69 +353,26 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 			break;
 		}
 
+		/* 打出每个请求的 timeline 槽归属：ring 里的 MI_SEMAPHORE_WAIT
+		 * 等的是某个具体 cacheline（第八阶段停在 0x100），这里钉死它属于谁。
+		 */
 		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: rq=%p seqno=%u hwsp=%llx:%u signaled=%d started=%d completed=%d ring=%08x match=%d\n",
+			 "hangcheck[%s]: rq=%p[%s] seqno=%u hwsp=%llx:%u tl{seq=%u off=%08x ggtt=%08x} ring=%08x match=%d sig=%d st=%d done=%d\n",
 			 engine->name, rq,
+			 rq == inflight ? "inflight" : "active",
 			 rq->fence.seqno,
 			 (u64)(unsigned long)rq->hwsp_seqno,
 			 READ_ONCE(*rq->hwsp_seqno),
+			 rq->timeline ? rq->timeline->seqno : 0,
+			 off, ggtt,
+			 ring, ring == ring_start,
 			 i915_request_signaled(rq),
 			 i915_request_started(rq),
-			 i915_request_completed(rq),
-			 ring, ring == ring_start);
+			 i915_request_completed(rq));
 
 		if (!first) {
 			first = rq;
-			ce = rq->hw_context;
-			if (ce) {
-				lrc_desc = ce->lrc_desc;
-				ctx_ggtt = ce->state ? i915_ggtt_offset(ce->state) : 0;
-				vm_total = ce->vm->total;
-				vm_4lvl = i915_vm_is_4lvl(ce->vm);
-				if (ce->lrc_reg_state) {
-					lrc_head = ce->lrc_reg_state[CTX_RING_HEAD + 1];
-					lrc_tail = ce->lrc_reg_state[CTX_RING_TAIL + 1];
-					lrc_start = ce->lrc_reg_state[CTX_RING_BUFFER_START + 1];
-					lrc_cc = ce->lrc_reg_state[CTX_CONTEXT_CONTROL + 1];
-					lrc_rbc = ce->lrc_reg_state[CTX_RING_BUFFER_CONTROL + 1];
-				}
-			}
-			if (rq->ring && rq->ring->vaddr && rq->ring->size) {
-				u32 mask = rq->ring->size - 1;
-				u32 pos = hw_head & mask & ~3u;
-				u32 pos2 = rq->head & mask & ~3u;
-
-				for (i = 0; i < ARRAY_SIZE(ring_dump); i++)
-					ring_dump[i] = *(const u32 *)
-						((const u8 *)rq->ring->vaddr +
-						 ((pos + i * 4) & mask));
-				for (i = 0; i < ARRAY_SIZE(req_dump); i++)
-					req_dump[i] = *(const u32 *)
-						((const u8 *)rq->ring->vaddr +
-						 ((pos2 + i * 4) & mask));
-				have_ring = true;
-			}
-			if (rq->timeline) {
-				tl_seqno = rq->timeline->seqno;
-				tl_hwsp_offset = rq->timeline->hwsp_offset;
-				tl_hwsp_ggtt =
-					i915_ggtt_offset(rq->timeline->hwsp_ggtt);
-				tl_hwsp_delta =
-					(s64)(unsigned long)rq->hwsp_seqno -
-					(s64)(unsigned long)rq->timeline->hwsp_seqno;
-			}
-			rq_head = rq->head;
-			rq_infix = rq->infix;
-			rq_postfix = rq->postfix;
-			rq_tail = rq->tail;
-			rq_wa_tail = rq->wa_tail;
-			if (rq->ring) {
-				ring_head = rq->ring->head;
-				ring_tail = rq->ring->tail;
-				ring_size = rq->ring->size;
-				ring_eff = rq->ring->effective_size;
-				ring_wrap = rq->ring->wrap;
-			}
+			hangcheck_sample_request(rq, &sample);
 		}
 	}
 	spin_unlock_irqrestore(&engine->active.lock, flags);
@@ -352,25 +387,28 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 READ_ONCE(execlists->queue_priority_hint));
 
 	if (!first)
-		return;
+		goto out;
 
 	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: ce=%p lrc_desc=%016llx ctx_ggtt=%08x lrc_head=%08x lrc_tail=%08x lrc_start=%08x\n",
-		 engine->name, ce, lrc_desc, ctx_ggtt,
-		 lrc_head, lrc_tail, lrc_start);
+		 engine->name, sample.ce, sample.lrc_desc, sample.ctx_ggtt,
+		 sample.lrc_head, sample.lrc_tail, sample.lrc_start);
 	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: rq head=%08x infix=%08x postfix=%08x tail=%08x wa_tail=%08x\n",
-		 engine->name, rq_head, rq_infix, rq_postfix, rq_tail, rq_wa_tail);
+		 engine->name, sample.rq_head, sample.rq_infix, sample.rq_postfix,
+		 sample.rq_tail, sample.rq_wa_tail);
 	dev_info(i915->drm.dev,
-		 "hangcheck[%s]: ring head=%08x tail=%08x size=%08x eff=%08x wrap=%08x\n",
-		 engine->name, ring_head, ring_tail, ring_size, ring_eff, ring_wrap);
+		 "hangcheck[%s]: ring head=%08x tail=%08x size=%08x eff=%08x wrap=%08x ggtt=%08x\n",
+		 engine->name, sample.ring_head, sample.ring_tail, sample.ring_size,
+		 sample.ring_eff, sample.ring_wrap, sample.ring_ggtt);
 	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: vm total=%llx 4lvl=%d lrc_cc=%08x lrc_rbc=%08x\n",
-		 engine->name, vm_total, vm_4lvl, lrc_cc, lrc_rbc);
+		 engine->name, sample.vm_total, sample.vm_4lvl,
+		 sample.lrc_cc, sample.lrc_rbc);
 	dev_info(i915->drm.dev,
 		 "hangcheck[%s]: tl seqno=%u hwsp_off=%08x hwsp_ggtt=%08x hwsp_delta=%lld\n",
-		 engine->name, tl_seqno, tl_hwsp_offset, tl_hwsp_ggtt,
-		 tl_hwsp_delta);
+		 engine->name, sample.tl_seqno, sample.tl_hwsp_offset,
+		 sample.tl_hwsp_ggtt, sample.tl_hwsp_delta);
 	{
 		struct i915_request *a0 = READ_ONCE(execlists->active[0]);
 		struct i915_request *a1 = READ_ONCE(execlists->active[1]);
@@ -387,7 +425,8 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	 * context image 里写的 PML4 与软件 ppgtt 根是否一致，并沿页表链
 	 * 查 ACTHD 是否真的映射（取指失败 vs 指令等待）。
 	 */
-	if (ce && ce->vm && ce->vm != &i915->ggtt.vm) {
+	if (sample.ce && sample.ce->vm && sample.ce->vm != &i915->ggtt.vm) {
+		struct intel_context *ce = sample.ce; /* 段内沿用原写法 */
 		struct i915_ppgtt *ppgtt = i915_vm_to_ppgtt(ce->vm);
 		u64 acthd = lower_32_bits(intel_engine_get_active_head(engine));
 		u64 pml4_dma = px_dma(ppgtt->pd);
@@ -470,7 +509,8 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 							u32 o = (u32)(acthd & ~3u & (PAGE_SIZE - 1));
 							u32 k;
 
-							for (k = 0; k < 4; k++) {
+							/* 第九轮：从 4 行扩到 8 行，看 ACTHD 前后的指令上下文 */
+							for (k = 0; k < 8; k++) {
 								u32 base = (o + k * 32) & (PAGE_SIZE - 1);
 
 								dev_info(i915->drm.dev,
@@ -522,14 +562,25 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		}
 	}
 
-	if (have_ring) {
-		u32 mask = ring_size - 1;
+	if (sample.rq && sample.rq->ring && sample.rq->ring->vaddr &&
+	    sample.ring_size) {
+		u32 mask = sample.ring_size - 1;
 		u32 hw = hw_head & mask & ~3u;
-		u32 rq = rq_head & mask & ~3u;
+		u32 rq_pos = sample.rq_head & mask & ~3u;
+
+		for (i = 0; i < ARRAY_SIZE(ring_dump); i++)
+			ring_dump[i] = *(const u32 *)
+				((const u8 *)sample.rq->ring->vaddr +
+				 ((hw + i * 4) & mask));
+		for (i = 0; i < ARRAY_SIZE(req_dump); i++)
+			req_dump[i] = *(const u32 *)
+				((const u8 *)sample.rq->ring->vaddr +
+				 ((rq_pos + i * 4) & mask));
 
 		/* ring 前半段：硬件 HEAD 之前的指令流（含本请求的 bb_start 目标） */
 		for (i = 0; i < 0x100; i += 32) {
-			const u32 *s = (const u32 *)((const u8 *)first->ring->vaddr + i);
+			const u32 *s = (const u32 *)
+				((const u8 *)sample.rq->ring->vaddr + i);
 
 			dev_info(i915->drm.dev,
 				 "hangcheck[%s]: @%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
@@ -559,12 +610,12 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 			 ring_dump[28], ring_dump[29], ring_dump[30], ring_dump[31]);
 		dev_info(i915->drm.dev,
 			 "hangcheck[%s]: @rq%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, rq,
+			 engine->name, rq_pos,
 			 req_dump[0], req_dump[1], req_dump[2], req_dump[3],
 			 req_dump[4], req_dump[5], req_dump[6], req_dump[7]);
 		dev_info(i915->drm.dev,
 			 "hangcheck[%s]: @rq%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, (rq + 32) & mask,
+			 engine->name, (rq_pos + 32) & mask,
 			 req_dump[8], req_dump[9], req_dump[10], req_dump[11],
 			 req_dump[12], req_dump[13], req_dump[14], req_dump[15]);
 	}
@@ -586,7 +637,16 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 intel_uncore_read(engine->uncore,
 				   _MMIO(engine->mmio_base + 0x514)),
 		 ENGINE_READ(engine, RING_EXECLIST_SQ_CONTENTS));
+
+out:
+	if (inflight)
+		i915_request_put(inflight);
 }
+
+/* Task#208 第九轮：每次开机最多抓几次 hang 现场（原 first_error 短路
+ * 在首次复位后永久生效，实测导致第二轮实验拿不到任何 dump）。
+ */
+static int hangcheck_dumps;
 
 static void hangcheck_declare_hang(struct intel_gt *gt,
 				   intel_engine_mask_t hung,
@@ -609,8 +669,10 @@ static void hangcheck_declare_hang(struct intel_gt *gt,
 				 "%s, ", engine->name);
 	msg[len-2] = '\0';
 
-	/* Task#208：只抓首次 hang 的现场，后续复位循环由 first_error 短路 */
-	if (!READ_ONCE(gt->i915->gpu_error.first_error))
+	/* Task#208 第九轮：首次复位后 first_error 即非空，后续 hang 会被永久
+	 * 短路（只有重启才清零）；改为每模块最多抓 3 次现场。
+	 */
+	if (++hangcheck_dumps <= 3)
 		for_each_engine_masked(engine, gt->i915, hung, tmp)
 			hangcheck_dump_engine(engine);
 

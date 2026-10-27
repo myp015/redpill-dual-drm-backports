@@ -88,5 +88,4 @@ obj-$(CONFIG_DRM_AST) += ast-v54/
 obj-$(CONFIG_DRM_TTM)	+= ttm/
 obj-$(CONFIG_DRM_SCHED)	+= scheduler/
 obj-$(CONFIG_DRM_AMDGPU)+= amd/amdgpu/
-obj-$(CONFIG_DRM_RADEON) += radeon/
 obj-$(CONFIG_DRM_I915)	+= i915/

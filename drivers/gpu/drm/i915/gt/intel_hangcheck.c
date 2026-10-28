@@ -317,22 +317,25 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 i915_ggtt_offset(engine->status_page.vma));
 
 	/*
-	 * Task#208 第十轮：第九轮读 *execlists->active 在 rcs0 上取到 NULL。
-	 * active 是随 execlists_schedule_out(*active++) 前进的浮动指针
-	 * （intel_lrc.c:1576/1608）；preempt-to-busy 把 inflight[0] 移回 priolist
-	 * 后指针已越过它，而 inflight[0] 仍保存硬件正在执行的请求
-	 * （现场：active port0=NULL，inflight[0]=seqno 14 非空）。
-	 * 以 inflight[0] 为主、*active 为备，并打印 active 偏移交叉验证。
-	 * 不再用 i915_request_completed() 过滤：僵尸请求正是要看现场。
+	 * Task#208 第十轮：第九轮的取样对象没错，错在被
+	 * i915_request_completed() 挡掉。实测 rcs0 上
+	 * *execlists->active == execlists->inflight[0] == ffff880637206f80
+	 * （seqno 14，硬件 RING_START=0x7f2000 HEAD=0x1b8 ACTHD=0x70b128），
+	 * 但该请求已被提前 fence signal 标记完成 —— 僵尸请求：软件认为它
+	 * 完成了，硬件仍在执行。因此不能按「已完成」跳过，僵尸请求正是
+	 * 要看的现场。旁证：error capture 只有 vcs0 段（seqno 2 未完成），
+	 * rcs0 段完全缺失。
+	 * 取源以 *active 为主（语义上就是硬件正在跑的槽），inflight[0] 兜底
+	 * （active 是指针，会被 execlists_schedule_out(*active++) 推进）。
 	 *
 	 * 这里不调 execlists_active()：它带 GEM_BUG_ON(active - inflight >
 	 * num_ports)，hang 现场 active 可能已越过哨兵。锁序：tasklet lock 必须
 	 * 先于 active.lock 取得/释放，不能嵌套在它里面。
 	 */
 	execlists_active_lock_bh(execlists);
-	inflight = READ_ONCE(execlists->inflight[0]);
+	inflight = READ_ONCE(*execlists->active);
 	if (!inflight)
-		inflight = READ_ONCE(*execlists->active);
+		inflight = READ_ONCE(execlists->inflight[0]);
 	active_off = (int)(execlists->active - execlists->inflight);
 	if (inflight)
 		i915_request_get(inflight);

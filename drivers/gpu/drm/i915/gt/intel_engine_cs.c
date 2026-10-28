@@ -1557,15 +1557,17 @@ intel_engine_find_active_request(struct intel_engine_cs *engine)
 	/*
 	 * Task#208 第十轮：inflight 请求可能因 preempt-to-busy 已回到 priolist，
 	 * 不在 active.requests（第八阶段现场：rcs0 硬件在跑 seqno 14，
-	 * active.requests 里只有 seqno 6）。先看硬件 inflight[] 槽：
-	 * active 是会被 schedule_out 推进的浮动指针，第九轮读 *active 在 rcs0
-	 * 上取到 NULL，而 inflight[0] 仍保存该请求。
+	 * active.requests 里只有 seqno 6）。先看硬件 active/inflight 槽。
+	 * 这里**不能用 i915_request_completed() 过滤**：rcs0 的 seqno 14 已被
+	 * 提前 fence signal 标记完成（僵尸请求），硬件仍在执行它；正是这道
+	 * 过滤让 error capture 一直缺 rcs0 段。inflight 槽本身持有引用，
+	 * 请求不会在 reset 前被释放。
 	 * 此处引擎已停（reset_prepare 已清 MMIO），不能用 match_ring 比对。
 	 */
-	request = READ_ONCE(engine->execlists.inflight[0]);
+	request = READ_ONCE(*engine->execlists.active);
 	if (!request)
-		request = READ_ONCE(*engine->execlists.active);
-	if (request && !i915_request_completed(request))
+		request = READ_ONCE(engine->execlists.inflight[0]);
+	if (request)
 		return request;
 
 	list_for_each_entry(request, &engine->active.requests, sched.link) {

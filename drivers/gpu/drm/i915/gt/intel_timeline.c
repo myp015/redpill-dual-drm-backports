@@ -200,6 +200,19 @@ static void cacheline_free(struct intel_timeline_cacheline *cl)
 	GEM_BUG_ON(ptr_test_bit(cl->vaddr, CACHELINE_FREE));
 	cl->vaddr = ptr_set_bit(cl->vaddr, CACHELINE_FREE);
 
+	/*
+	 * Task#208 第十一轮：HWSP cacheline 的释放/回收是「僵尸请求」的头号嫌疑
+	 * —— 若某 cacheline 在仍有 inflight 请求时被另一个 timeline 复用，
+	 * 两个 timeline 的 seqno 就会落进同一个槽，i915_seqno_passed() 误判
+	 * ⇒ fence 提前 signal ⇒ 驱动以为硬件已跑完 ⇒ 复用环形缓冲 ⇒ 挂死。
+	 * 这里只打一行，配合 intel_timeline_pin 的 acquire 行，能完整还原
+	 * 每个 cacheline 的归属时间线。
+	 */
+	dev_info(cl->hwsp->gt->i915->drm.dev,
+		 "hwsp[free]: cl=%p vaddr=%p idle=%d\n",
+		 cl, page_mask_bits(cl->vaddr),
+		 (int)i915_active_is_idle(&cl->active));
+
 	if (i915_active_is_idle(&cl->active))
 		__idle_cacheline_free(cl);
 }
@@ -326,6 +339,16 @@ int intel_timeline_pin(struct intel_timeline *tl)
 		offset_in_page(tl->hwsp_offset);
 
 	cacheline_acquire(tl->hwsp_cacheline);
+	/*
+	 * Task#208 第十一轮：这条 acquire 行 + cacheline_free 的 free 行，
+	 * 构成每个 HWSP cacheline 的完整归属时间线。重点看 hwsp_off 是否
+	 * 在旧 timeline 仍有 inflight 请求时被新的 timeline 复用。
+	 */
+	dev_info(tl->gt->i915->drm.dev,
+		 "hwsp[pin]: tl=%p hwsp_off=%08x seqno=%u cl=%p vaddr=%p\n",
+		 tl, tl->hwsp_offset, tl->seqno, tl->hwsp_cacheline,
+		 tl->hwsp_cacheline ? page_mask_bits(tl->hwsp_cacheline->vaddr) : NULL);
+
 	if (atomic_fetch_inc(&tl->pin_count)) {
 		cacheline_release(tl->hwsp_cacheline);
 		__i915_vma_unpin(tl->hwsp_ggtt);

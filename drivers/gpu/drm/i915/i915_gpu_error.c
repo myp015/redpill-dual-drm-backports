@@ -1190,12 +1190,27 @@ static void engine_record_requests(struct intel_engine_cs *engine,
 				   struct drm_i915_error_engine *ee)
 {
 	struct i915_request *request;
-	int count;
+	int count, total;
+	bool first_in_list = false;
 
-	count = 0;
-	request = first;
-	list_for_each_entry_from(request, &engine->active.requests, sched.link)
-		count++;
+	/*
+	 * Task#208 第十轮：first 可能是 intel_engine_find_active_request() 从
+	 * execlists->active 槽取出的 inflight 请求，它已被 remove_from_engine()
+	 * 的 list_del() 摘出 active.requests（sched.link.next == LIST_POISON1）。
+	 * 用 list_for_each_entry_from(first) 会顺着毒指针崩溃 —— 第十轮现场:
+	 * i915_capture_gpu_state GPF，RAX=dead000000000100，
+	 * 指令 mov 0x158(%rdx),%rax（0x158 = sched.link 偏移），
+	 * RDX = 0xdead000000000100 - 0x158；且崩在持 active.lock 期间，
+	 * 锁不释放 + 后续 kthread_data GPF 连锁，整机锁死。
+	 * 因此改为从表头完整遍历（必然终止），first 不在表中时单独补录。
+	 */
+	total = 0;
+	list_for_each_entry(request, &engine->active.requests, sched.link) {
+		total++;
+		if (request == first)
+			first_in_list = true;
+	}
+	count = total + (first_in_list ? 0 : 1);
 	if (!count)
 		return;
 
@@ -1206,9 +1221,7 @@ static void engine_record_requests(struct intel_engine_cs *engine,
 	ee->num_requests = count;
 
 	count = 0;
-	request = first;
-	list_for_each_entry_from(request,
-				 &engine->active.requests, sched.link) {
+	list_for_each_entry(request, &engine->active.requests, sched.link) {
 		if (count >= ee->num_requests) {
 			/*
 			 * If the ring request list was changed in
@@ -1230,6 +1243,8 @@ static void engine_record_requests(struct intel_engine_cs *engine,
 
 		record_request(request, &ee->requests[count++]);
 	}
+	if (!first_in_list && count < ee->num_requests)
+		record_request(first, &ee->requests[count++]);
 	ee->num_requests = count;
 }
 
@@ -1388,6 +1403,16 @@ gem_record_rings(struct i915_gpu_state *error, struct compress *compress)
 		error->simulated |= record_context(&ee->context, request);
 
 		/*
+		 * Task#208 第十一轮：inflight 僵尸请求若已经过 __i915_request_retire，
+		 * 它的 capture_list 已被 free_capture_list() 释放（指针未置空）、
+		 * rq->batch 也不再由请求持有，再交给 capture_vma() /
+		 * request_record_user_bo() 会读已释放内存。环与 context 由仍未释放的
+		 * rq->hw_context 持有，照常抓；batchbuffer 改由 hangcheck dump 提供。
+		 */
+		if (i915_request_signaled(request))
+			goto capture_ctx;
+
+		/*
 		 * We need to copy these to an anonymous buffer
 		 * as the simplest method to avoid being overwritten
 		 * by userspace.
@@ -1403,6 +1428,7 @@ gem_record_rings(struct i915_gpu_state *error, struct compress *compress)
 
 		capture = request_record_user_bo(request, ee, capture);
 
+capture_ctx:
 		capture = capture_vma(capture,
 				      request->hw_context->state,
 				      &ee->ctx);

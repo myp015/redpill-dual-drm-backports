@@ -242,6 +242,19 @@ struct hangcheck_sample {
 	u32 ring_head, ring_tail, ring_size, ring_eff, ring_wrap;
 	u32 tl_seqno, tl_hwsp_offset, tl_hwsp_ggtt;
 	s64 tl_hwsp_delta;
+	/*
+	 * Task#208 第十一轮：把「这个请求凭什么被判完成」的原始依据打出来。
+	 * - decoupled：i915_request_mark_complete() 会把 rq->hwsp_seqno 重定向到
+	 *   &rq->fence.seqno（脱钩 HWSP），此后 completed 恒为真 —— 第十轮
+	 *   hwsp[fc0]=14 就是这么来的假象（读的是 fence 自己的 seqno，不是硬件写的）。
+	 * - tl_hwsp_val：timeline 真实 HWSP 槽的当前值，只有它才代表硬件进度。
+	 * - link{next,prev}：只打指针不追链，判断请求是否已被 list_del 毒化。
+	 */
+	unsigned long fence_flags;
+	int fence_error;
+	bool hwsp_decoupled;
+	u32 tl_hwsp_val;
+	unsigned long link_next, link_prev;
 };
 
 static void
@@ -278,6 +291,13 @@ hangcheck_sample_request(struct i915_request *rq, struct hangcheck_sample *s)
 		s->tl_hwsp_delta = (s64)(unsigned long)rq->hwsp_seqno -
 				   (s64)(unsigned long)rq->timeline->hwsp_seqno;
 	}
+	s->fence_flags = rq->fence.flags;
+	s->fence_error = rq->fence.error;
+	s->hwsp_decoupled = (rq->hwsp_seqno == (u32 *)&rq->fence.seqno);
+	s->link_next = (unsigned long)rq->link.next;
+	s->link_prev = (unsigned long)rq->link.prev;
+	if (rq->timeline && rq->timeline->hwsp_seqno)
+		s->tl_hwsp_val = READ_ONCE(*rq->timeline->hwsp_seqno);
 	s->rq_head = rq->head;
 	s->rq_infix = rq->infix;
 	s->rq_postfix = rq->postfix;
@@ -419,6 +439,11 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 "hangcheck[%s]: tl seqno=%u hwsp_off=%08x hwsp_ggtt=%08x hwsp_delta=%lld\n",
 		 engine->name, sample.tl_seqno, sample.tl_hwsp_offset,
 		 sample.tl_hwsp_ggtt, sample.tl_hwsp_delta);
+	dev_info(i915->drm.dev,
+		 "hangcheck[%s]: fence flags=%lx error=%d hwsp_decoupled=%d tl_hwsp_val=%08x link{%p,%p}\n",
+		 engine->name, sample.fence_flags, sample.fence_error,
+		 (int)sample.hwsp_decoupled, sample.tl_hwsp_val,
+		 (void *)sample.link_next, (void *)sample.link_prev);
 	{
 		struct i915_request *f0 = READ_ONCE(execlists->inflight[0]);
 		struct i915_request *f1 = READ_ONCE(execlists->inflight[1]);

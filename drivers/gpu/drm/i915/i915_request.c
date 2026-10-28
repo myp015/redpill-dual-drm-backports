@@ -252,8 +252,8 @@ void i915_request_report_hwsp_behind(const char *where,
 		 rq->hwsp_seqno ? __hwsp_seqno(rq) : 0u,
 		 rq->fence.flags, (int)i915_request_signaled(rq),
 		 (int)i915_request_is_active(rq),
-		 rq->dbg_signal_origin, rq->dbg_signal_hwsp,
-		 (long long)rq->fence.timestamp,
+		 (unsigned)rq->dbg_signal_origin, rq->dbg_signal_hwsp,
+		 (long long)ktime_to_ns(rq->fence.timestamp),
 		 rq->engine ? rq->engine->name : "?", jiffies);
 }
 

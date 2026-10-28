@@ -189,6 +189,13 @@ void intel_engine_breadcrumbs_irq(struct intel_engine_cs *engine)
 			list_entry(pos, typeof(*rq), signal_link);
 		struct list_head cb_list;
 
+		/*
+		 * Task#208 第十二轮：breadcrumbs 是除 wait 之外的第二条 signal 路径，
+		 * 它同样只用 __request_completed()（即 rq->hwsp_seqno）判定完成。
+		 * 这里在拿 rq->lock 之前、不持 b->irq_lock 时打点，异常才输出。
+		 */
+		i915_request_report_hwsp_behind("breadcrumb", rq);
+
 		spin_lock(&rq->lock);
 		/* 4.4.302: cb_list 与 timestamp 是独立字段（5.4 是 union），
 		 * 后面的 __dma_fence_signal__timestamp() 不会覆盖旧链表头，

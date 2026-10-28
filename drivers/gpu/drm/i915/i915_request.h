@@ -300,6 +300,10 @@ void i915_request_skip(struct i915_request *request, int error);
 void __i915_request_unsubmit(struct i915_request *request);
 void i915_request_unsubmit(struct i915_request *request);
 
+/* Task#208 第十二轮：完成判据伪造探针（实现与理由见 i915_request.c） */
+void i915_request_report_hwsp_behind(const char *where,
+				     struct i915_request *rq);
+
 /* Note: part of the intel_breadcrumbs family */
 bool i915_request_enable_breadcrumb(struct i915_request *request);
 void i915_request_cancel_breadcrumb(struct i915_request *request);

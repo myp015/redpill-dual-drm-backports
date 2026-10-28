@@ -217,6 +217,34 @@ static void cacheline_free(struct intel_timeline_cacheline *cl)
 		__idle_cacheline_free(cl);
 }
 
+static atomic_t hwsp_memset_reports = ATOMIC_INIT(0);
+
+/*
+ * Task#208 第十二轮：两处 memset 都是「把 seqno 槽清零后重新开始计数」。
+ * 正常情况下这块内存本就该是 0；若清零前槽里已有非 0 值（旧 timeline 的残留、
+ * 或硬件尚未跑完的 inflight 值），说明这块 cacheline 被提前复用 —— 后续
+ * 请求就可能读到旧值造成 i915_seqno_passed() 误判。只报异常、限流 16 条。
+ */
+static void report_hwsp_memset(const char *where, struct intel_gt *gt,
+			       const void *vaddr, u32 offset)
+{
+	const u32 *p = (const u32 *)((const char *)vaddr + offset);
+	u32 w0 = READ_ONCE(p[0]);
+	u32 w1 = READ_ONCE(p[1]);
+	u32 w2 = READ_ONCE(p[2]);
+	u32 w3 = READ_ONCE(p[3]);
+
+	if (!w0)
+		return;
+
+	if (atomic_inc_return(&hwsp_memset_reports) > 16)
+		return;
+
+	dev_info(gt->i915->drm.dev,
+		 "hwsp[memset]: %s off=%08x old=%08x %08x %08x %08x j=%lu\n",
+		 where, offset, w0, w1, w2, w3, jiffies);
+}
+
 int intel_timeline_init(struct intel_timeline *timeline,
 			struct intel_gt *gt,
 			struct i915_vma *hwsp)
@@ -256,6 +284,8 @@ int intel_timeline_init(struct intel_timeline *timeline,
 		if (IS_ERR(vaddr))
 			return PTR_ERR(vaddr);
 	}
+
+	report_hwsp_memset("init", gt, vaddr, timeline->hwsp_offset);
 
 	timeline->hwsp_seqno =
 		memset(vaddr + timeline->hwsp_offset, 0, CACHELINE_BYTES);
@@ -479,6 +509,9 @@ __intel_timeline_get_seqno(struct intel_timeline *tl,
 
 	vaddr = page_mask_bits(cl->vaddr);
 	tl->hwsp_offset = cacheline * CACHELINE_BYTES;
+
+	report_hwsp_memset("get_seqno", tl->gt, vaddr, tl->hwsp_offset);
+
 	tl->hwsp_seqno =
 		memset(vaddr + tl->hwsp_offset, 0, CACHELINE_BYTES);
 

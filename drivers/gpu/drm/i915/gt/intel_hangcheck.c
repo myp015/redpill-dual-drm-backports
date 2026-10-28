@@ -312,7 +312,7 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	struct i915_request *rq, *first = NULL, *inflight = NULL;
 	struct hangcheck_sample sample;
 	unsigned long flags;
-	u32 ring_dump[32], req_dump[16];
+	u32 ring_dump[256], req_dump[16];
 	int i;
 	u32 ring_start, hw_head;
 	int count = 0;
@@ -574,17 +574,27 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	 * 引擎 status page 的 preempt 地址（fini breadcrumb 结尾的
 	 * busywait 目标，等它归零）。
 	 */
-	if (first && first->hwsp_seqno) {
+	/*
+	 * Task#208 第十二轮：必须用 rq->timeline->hwsp_seqno，不能用
+	 * rq->hwsp_seqno —— 已判完成的请求被 i915_request_mark_complete()
+	 * 脱钩成 &rq->fence.seqno，读到的 page 是 i915_request 的 slab 页
+	 * （第十一轮现场 page=ffff880633202000 self=fc0 val=0000000e 就是这个坑）。
+	 */
+	if (first && first->timeline && first->timeline->hwsp_seqno) {
+		const struct intel_timeline *tl = first->timeline;
 		const u32 *h = (const u32 *)
-			((unsigned long)first->hwsp_seqno & PAGE_MASK);
+			((unsigned long)tl->hwsp_seqno & PAGE_MASK);
 		const u32 *sp = (const u32 *)engine->status_page.addr;
 		int k;
 
 		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: hwsp page=%p self=%03x val=%08x preempt_off=%03x preempt=%08x\n",
+			 "hangcheck[%s]: hwsp page=%p self=%03x tl_val=%08x rqptr=%p rq_val=%08x tl_off=%08x preempt_off=%03x preempt=%08x\n",
 			 engine->name, h,
-			 (u32)((unsigned long)first->hwsp_seqno & ~PAGE_MASK),
-			 READ_ONCE(*first->hwsp_seqno),
+			 (u32)((unsigned long)tl->hwsp_seqno & ~PAGE_MASK),
+			 READ_ONCE(*tl->hwsp_seqno),
+			 first->hwsp_seqno,
+			 first->hwsp_seqno ? READ_ONCE(*first->hwsp_seqno) : 0u,
+			 tl->hwsp_offset,
 			 (u32)I915_GEM_HWS_PREEMPT_ADDR,
 			 sp ? READ_ONCE(sp[I915_GEM_HWS_PREEMPT_ADDR / 4]) : ~0u);
 		for (k = 0; k < 64; k++) {
@@ -623,26 +633,21 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 				 s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
 		}
 
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, hw,
-			 ring_dump[0], ring_dump[1], ring_dump[2], ring_dump[3],
-			 ring_dump[4], ring_dump[5], ring_dump[6], ring_dump[7]);
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, (hw + 32) & mask,
-			 ring_dump[8], ring_dump[9], ring_dump[10], ring_dump[11],
-			 ring_dump[12], ring_dump[13], ring_dump[14], ring_dump[15]);
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, (hw + 64) & mask,
-			 ring_dump[16], ring_dump[17], ring_dump[18], ring_dump[19],
-			 ring_dump[20], ring_dump[21], ring_dump[22], ring_dump[23]);
-		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 engine->name, (hw + 96) & mask,
-			 ring_dump[24], ring_dump[25], ring_dump[26], ring_dump[27],
-			 ring_dump[28], ring_dump[29], ring_dump[30], ring_dump[31]);
+		/*
+		 * Task#208 第十二轮：从 4 行扩到 32 行（0x400 字节）。
+		 * 第十一轮现场 HEAD=0x1b8，剩余 0x310 字节未执行，环里只能看到
+		 * 值为 1/2/3/6 的 fini breadcrumb —— 需要足够跨度数清「HEAD 之后
+		 * 到底还剩几条 breadcrumb」，才能证明硬件落后驱动多少个请求。
+		 */
+		for (i = 0; i < (int)ARRAY_SIZE(ring_dump); i += 8) {
+			dev_info(i915->drm.dev,
+				 "hangcheck[%s]: @hw%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				 engine->name, (hw + i * 4) & mask,
+				 ring_dump[i + 0], ring_dump[i + 1],
+				 ring_dump[i + 2], ring_dump[i + 3],
+				 ring_dump[i + 4], ring_dump[i + 5],
+				 ring_dump[i + 6], ring_dump[i + 7]);
+		}
 		dev_info(i915->drm.dev,
 			 "hangcheck[%s]: @rq%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
 			 engine->name, rq_pos,

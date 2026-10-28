@@ -212,6 +212,49 @@ static void free_capture_list(struct i915_request *request)
 	}
 }
 
+/*
+ * Task#208 第十二轮：判据伪造探针。
+ *
+ * 第十一轮现场实锤：rcs0 上 seqno=14 的请求已经 retire（sched.link 被
+ * list_del 成 LIST_POISON1/2、fence 的 SIGNALED 位置位、hwsp_decoupled=1），
+ * 而它 timeline 的真实 HWSP 槽只读到 5，硬件 RING_HEAD=0x1b8 恰好停在该槽
+ * "写 6" 的 fini breadcrumb 之前。也就是说「已完成」这个结论没有任何硬件
+ * 进展支撑，驱动比硬件多跑了 8 个请求，随后把环形缓冲/批次对象复用掉，
+ * 硬件于是读着被重写过的内存一路挂死。
+ *
+ * i915_request_completed() 只有两条通过路径：SIGNALED 位；或
+ * *rq->hwsp_seqno >= seqno。后者要求槽值 >= seqno，而槽值只由硬件单调写入
+ * （CPU 侧只在换 cacheline 时清零），所以**此刻槽值落后 = 判据被伪造**。
+ * 在真正会 signal/retire 的点上挂这个探针，抓第一次落网的现场。
+ */
+static atomic_t hwsp_behind_reports = ATOMIC_INIT(0);
+
+void i915_request_report_hwsp_behind(const char *where,
+				     struct i915_request *rq)
+{
+	const struct intel_timeline *tl = rq->timeline;
+	u32 tlval;
+
+	if (!tl || !tl->hwsp_seqno)
+		return;
+
+	tlval = READ_ONCE(*tl->hwsp_seqno);
+	if (i915_seqno_passed(tlval, (u32)rq->fence.seqno))
+		return;
+
+	if (atomic_inc_return(&hwsp_behind_reports) > 32)
+		return;
+
+	dev_info(rq->i915->drm.dev,
+		 "hwsp-behind[%s]: rq=%p seqno=%u tloff=%08x tlseq=%u tlptr=%p tlval=%08x rqptr=%p rqval=%08x flags=%lx sig=%d act=%d eng=%s j=%lu\n",
+		 where, rq, (u32)rq->fence.seqno, tl->hwsp_offset, tl->seqno,
+		 tl->hwsp_seqno, tlval, rq->hwsp_seqno,
+		 rq->hwsp_seqno ? __hwsp_seqno(rq) : 0u,
+		 rq->fence.flags, (int)i915_request_signaled(rq),
+		 (int)i915_request_is_active(rq),
+		 rq->engine ? rq->engine->name : "?", jiffies);
+}
+
 static void remove_from_engine(struct i915_request *rq)
 {
 	struct intel_engine_cs *engine, *locked;
@@ -240,6 +283,9 @@ static bool i915_request_retire(struct i915_request *rq)
 	lockdep_assert_held(&rq->timeline->mutex);
 	if (!i915_request_completed(rq))
 		return false;
+
+	/* Task#208 第十二轮：完成门禁在这里放行，但硬件槽还没走到 seqno。 */
+	i915_request_report_hwsp_behind("retire", rq);
 
 	GEM_TRACE("%s fence %llx:%lld, current %d\n",
 		  rq->engine->name,
@@ -1462,6 +1508,7 @@ long i915_request_wait(struct i915_request *rq,
 	 */
 	if (CONFIG_DRM_I915_SPIN_REQUEST &&
 	    __i915_spin_request(rq, state, CONFIG_DRM_I915_SPIN_REQUEST)) {
+		i915_request_report_hwsp_behind("wait-spin", rq);
 		dma_fence_signal(&rq->fence);
 		goto out;
 	}
@@ -1492,6 +1539,7 @@ long i915_request_wait(struct i915_request *rq,
 		set_current_state(state);
 
 		if (i915_request_completed(rq)) {
+			i915_request_report_hwsp_behind("wait-loop", rq);
 			dma_fence_signal(&rq->fence);
 			break;
 		}

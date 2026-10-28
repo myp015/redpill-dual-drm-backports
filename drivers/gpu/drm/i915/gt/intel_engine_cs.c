@@ -1555,12 +1555,16 @@ intel_engine_find_active_request(struct intel_engine_cs *engine)
 	lockdep_assert_held(&engine->active.lock);
 
 	/*
-	 * Task#208 第九轮：inflight 请求可能因 preempt-to-busy 已回到 priolist，
+	 * Task#208 第十轮：inflight 请求可能因 preempt-to-busy 已回到 priolist，
 	 * 不在 active.requests（第八阶段现场：rcs0 硬件在跑 seqno 14，
-	 * active.requests 里只有 seqno 6）。先看硬件 active 槽。
+	 * active.requests 里只有 seqno 6）。先看硬件 inflight[] 槽：
+	 * active 是会被 schedule_out 推进的浮动指针，第九轮读 *active 在 rcs0
+	 * 上取到 NULL，而 inflight[0] 仍保存该请求。
 	 * 此处引擎已停（reset_prepare 已清 MMIO），不能用 match_ring 比对。
 	 */
-	request = READ_ONCE(*engine->execlists.active);
+	request = READ_ONCE(engine->execlists.inflight[0]);
+	if (!request)
+		request = READ_ONCE(*engine->execlists.active);
 	if (request && !i915_request_completed(request))
 		return request;
 

@@ -296,6 +296,7 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 	int i;
 	u32 ring_start, hw_head;
 	int count = 0;
+	int active_off;
 
 	memset(&sample, 0, sizeof(sample));
 
@@ -316,28 +317,34 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 i915_ggtt_offset(engine->status_page.vma));
 
 	/*
-	 * Task#208 第九轮：preempt-to-busy 下，正在硬件上执行的请求会被
-	 * __unwind_incomplete_requests() 移回 priolist（intel_lrc.c:509），
-	 * 不再出现在 active.requests 里。必须以 execlists->active 槽为取样对象，
-	 * 否则 ring / PPGTT / batch 全读到错误的 context（第八阶段实测：
-	 * rcs0 用 seqno 6 的 ring 0x1d6000，而硬件在跑 seqno 14 的 0x7f2000）。
+	 * Task#208 第十轮：第九轮读 *execlists->active 在 rcs0 上取到 NULL。
+	 * active 是随 execlists_schedule_out(*active++) 前进的浮动指针
+	 * （intel_lrc.c:1576/1608）；preempt-to-busy 把 inflight[0] 移回 priolist
+	 * 后指针已越过它，而 inflight[0] 仍保存硬件正在执行的请求
+	 * （现场：active port0=NULL，inflight[0]=seqno 14 非空）。
+	 * 以 inflight[0] 为主、*active 为备，并打印 active 偏移交叉验证。
+	 * 不再用 i915_request_completed() 过滤：僵尸请求正是要看现场。
 	 *
 	 * 这里不调 execlists_active()：它带 GEM_BUG_ON(active - inflight >
 	 * num_ports)，hang 现场 active 可能已越过哨兵。锁序：tasklet lock 必须
 	 * 先于 active.lock 取得/释放，不能嵌套在它里面。
 	 */
 	execlists_active_lock_bh(execlists);
-	inflight = READ_ONCE(*execlists->active);
+	inflight = READ_ONCE(execlists->inflight[0]);
+	if (!inflight)
+		inflight = READ_ONCE(*execlists->active);
+	active_off = (int)(execlists->active - execlists->inflight);
 	if (inflight)
 		i915_request_get(inflight);
 	execlists_active_unlock_bh(execlists);
 
-	if (inflight && !i915_request_completed(inflight)) {
+	if (inflight) {
 		first = inflight;
 		hangcheck_sample_request(first, &sample);
 		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: sample=inflight rq=%p seqno=%u ring=%08x\n",
-			 engine->name, first, first->fence.seqno, sample.ring_ggtt);
+			 "hangcheck[%s]: sample=inflight rq=%p seqno=%u ring=%08x act=%d done=%d\n",
+			 engine->name, first, first->fence.seqno, sample.ring_ggtt,
+			 active_off, i915_request_completed(first));
 	}
 
 	spin_lock_irqsave(&engine->active.lock, flags);
@@ -410,13 +417,13 @@ static void hangcheck_dump_engine(struct intel_engine_cs *engine)
 		 engine->name, sample.tl_seqno, sample.tl_hwsp_offset,
 		 sample.tl_hwsp_ggtt, sample.tl_hwsp_delta);
 	{
-		struct i915_request *a0 = READ_ONCE(execlists->active[0]);
-		struct i915_request *a1 = READ_ONCE(execlists->active[1]);
+		struct i915_request *f0 = READ_ONCE(execlists->inflight[0]);
+		struct i915_request *f1 = READ_ONCE(execlists->inflight[1]);
 
 		dev_info(i915->drm.dev,
-			 "hangcheck[%s]: active port0=%p(seqno %u) port1=%p(seqno %u)\n",
-			 engine->name, a0, a0 ? a0->fence.seqno : 0,
-			 a1, a1 ? a1->fence.seqno : 0);
+			 "hangcheck[%s]: inflight[0]=%p(seqno %u) [1]=%p(seqno %u) active_off=%d\n",
+			 engine->name, f0, f0 ? f0->fence.seqno : 0,
+			 f1, f1 ? f1->fence.seqno : 0, active_off);
 	}
 
 	/*

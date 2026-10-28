@@ -135,6 +135,65 @@ void i915_gem_close_object(struct drm_gem_object *gem, struct drm_file *file)
 	}
 }
 
+static atomic_t fence_free_reports = ATOMIC_INIT(0);
+
+/*
+ * Task#208 第十三轮：对象释放时把 resv 里的 fence 无条件 signal 出去，是本驱动
+ * 「完成判据被伪造」的第三个入口（前两个已排除：breadcrumbs 与 i915_request_wait
+ * 都必须先过 i915_request_completed()）。
+ *
+ * 现场证据（2026-10-28 第十二轮实机，rcs0）：seqno=4/10/18/22/26/36/42 的请求在
+ * retire 时 timeline 槽只读到 3/9/16/21/25/35/41（落后 1~2 个请求），而
+ * fence.flags=0xb = SIGNALED|TIMESTAMP|ACTIVE、ENABLE_SIGNAL(bit2)=0 ——
+ * breadcrumbs 路径必然置过 ENABLE_SIGNAL，wait 路径（add_callback）也会置，
+ * 因此这个 SIGNALED 只可能来自旁路直接 dma_fence_signal()；本树里唯一这样的
+ * 位置就是这里（4.4.302 backport，为压 dma_fence_release 的 WARN 而加）。
+ *
+ * 请求 fence 的完成只能由硬件进度（breadcrumbs）或复位路径给出；在对象释放时
+ * 替硬件宣布完成，会让 i915_request_completed() 说谎 ⇒ 僵尸请求 ⇒ 环形缓冲/
+ * 批次对象被复用 ⇒ 硬件读被重写内存后挂死。故：
+ *   - i915 请求 fence：先按硬件判据（i915_request_completed）核对 —— 判据为真
+ *     才 signal（幂等，只为排空 cb_list 帮 release 消 WARN），为假则只报告；
+ *   - 其它 fence（dma-buf 等）：维持原行为。
+ *
+ * 注：i915_vma_move_to_active() 会把在飞请求的 fence 加进 vma->resv
+ * （GGTT vma 即 obj->base._resv，i915_vma.c:915/923），所以对象 resv 里带着
+ * 未完成请求 fence 是常态，这里正是那条旁路。
+ */
+static void __free_object_fence(struct drm_i915_private *i915,
+				struct drm_i915_gem_object *obj,
+				const char *where,
+				struct dma_fence *fence)
+{
+	if (!fence)
+		return;
+
+	if (dma_fence_is_i915(fence)) {
+		struct i915_request *rq = to_request(fence);
+
+		if (i915_request_completed(rq)) {
+			dma_fence_signal(fence);
+			return;
+		}
+
+		if (atomic_inc_return(&fence_free_reports) <= 16) {
+			const struct intel_timeline *tl = rq->timeline;
+
+			dev_info(i915->drm.dev,
+				 "fence-free[%s]: obj=%p rq=%p seqno=%u flags=%lx act=%d eng=%s tlval=%08x j=%lu\n",
+				 where, obj, rq, (u32)rq->fence.seqno,
+				 rq->fence.flags,
+				 (int)i915_request_is_active(rq),
+				 rq->engine ? rq->engine->name : "?",
+				 (tl && tl->hwsp_seqno) ? READ_ONCE(*tl->hwsp_seqno) : 0u,
+				 jiffies);
+		}
+		return;
+	}
+
+	dma_fence_signal(fence);
+}
+
 static void __i915_gem_free_object_rcu(struct rcu_head *head)
 {
 	struct drm_i915_gem_object *obj =
@@ -148,12 +207,11 @@ static void __i915_gem_free_object_rcu(struct rcu_head *head)
 	/* 4.4.302 backport: signal all pending fences to drain cb_list
 	 * before fini, preventing dma_fence_release WARN_ON(!list_empty). */
 	excl = reservation_object_get_excl(resv);
-	if (excl)
-		dma_fence_signal(excl);
+	__free_object_fence(i915, obj, "excl", excl);
 	flist = reservation_object_get_list(resv);
 	if (flist) {
 		for (i = 0; i < flist->shared_count; i++)
-			dma_fence_signal(flist->shared[i]);
+			__free_object_fence(i915, obj, "shared", flist->shared[i]);
 	}
 	reservation_object_fini(resv);
 	i915_gem_object_free(obj);

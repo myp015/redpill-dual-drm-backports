@@ -157,6 +157,8 @@ void intel_engine_breadcrumbs_irq(struct intel_engine_cs *engine)
 					     &rq->fence.flags));
 			clear_bit(I915_FENCE_FLAG_SIGNAL, &rq->fence.flags);
 
+			if (!test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &rq->fence.flags))
+				i915_dbg_signal_origin(rq, I915_DBG_SIG_BREADCRUMB);
 			if (!__dma_fence_signal(&rq->fence))
 				continue;
 

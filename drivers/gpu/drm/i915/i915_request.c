@@ -246,12 +246,14 @@ void i915_request_report_hwsp_behind(const char *where,
 		return;
 
 	dev_info(rq->i915->drm.dev,
-		 "hwsp-behind[%s]: rq=%p seqno=%u tloff=%08x tlseq=%u tlptr=%p tlval=%08x rqptr=%p rqval=%08x flags=%lx sig=%d act=%d eng=%s j=%lu\n",
+		 "hwsp-behind[%s]: rq=%p seqno=%u tloff=%08x tlseq=%u tlptr=%p tlval=%08x rqptr=%p rqval=%08x flags=%lx sig=%d act=%d org=%u sghwsp=%08x ts=%lld eng=%s j=%lu\n",
 		 where, rq, (u32)rq->fence.seqno, tl->hwsp_offset, tl->seqno,
 		 tl->hwsp_seqno, tlval, rq->hwsp_seqno,
 		 rq->hwsp_seqno ? __hwsp_seqno(rq) : 0u,
 		 rq->fence.flags, (int)i915_request_signaled(rq),
 		 (int)i915_request_is_active(rq),
+		 rq->dbg_signal_origin, rq->dbg_signal_hwsp,
+		 (long long)rq->fence.timestamp,
 		 rq->engine ? rq->engine->name : "?", jiffies);
 }
 
@@ -348,8 +350,10 @@ static bool i915_request_retire(struct i915_request *rq)
 
 	spin_lock(&rq->lock);
 	i915_request_mark_complete(rq);
-	if (!i915_request_signaled(rq))
+	if (!i915_request_signaled(rq)) {
+		i915_dbg_signal_origin(rq, I915_DBG_SIG_RETIRE);
 		dma_fence_signal_locked(&rq->fence);
+	}
 	if (test_bit(DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT, &rq->fence.flags))
 		i915_request_cancel_breadcrumb(rq);
 	if (i915_request_has_waitboost(rq)) {
@@ -765,6 +769,9 @@ __i915_request_create(struct intel_context *ce, gfp_t gfp)
 	rq->capture_list = NULL;
 	rq->flags = 0;
 	rq->execution_mask = ALL_ENGINES;
+	/* Task#208 第十四轮诊断字段（slab 未清零） */
+	rq->dbg_signal_origin = I915_DBG_SIG_NONE;
+	rq->dbg_signal_hwsp = 0;
 
 	INIT_LIST_HEAD(&rq->active_list);
 	INIT_LIST_HEAD(&rq->execute_cb);
@@ -1509,6 +1516,9 @@ long i915_request_wait(struct i915_request *rq,
 	if (CONFIG_DRM_I915_SPIN_REQUEST &&
 	    __i915_spin_request(rq, state, CONFIG_DRM_I915_SPIN_REQUEST)) {
 		i915_request_report_hwsp_behind("wait-spin", rq);
+		/* 只在真正由本路径首次置位时记录来源，避免被后续 no-op signal 覆盖 */
+		if (!i915_request_signaled(rq))
+			i915_dbg_signal_origin(rq, I915_DBG_SIG_WAIT_SPIN);
 		dma_fence_signal(&rq->fence);
 		goto out;
 	}
@@ -1540,6 +1550,8 @@ long i915_request_wait(struct i915_request *rq,
 
 		if (i915_request_completed(rq)) {
 			i915_request_report_hwsp_behind("wait-loop", rq);
+			if (!i915_request_signaled(rq))
+				i915_dbg_signal_origin(rq, I915_DBG_SIG_WAIT_LOOP);
 			dma_fence_signal(&rq->fence);
 			break;
 		}

@@ -227,6 +227,16 @@ struct i915_request {
 	/** file_priv list entry for this request */
 	struct list_head client_link;
 
+	/*
+	 * Task#208 第十四轮诊断：记录「谁把本请求 fence 置成 SIGNALED」以及置位
+	 * 那一刻 HWSP 槽里的值。第十二轮实机发现 retire 门禁处 flags=0xb
+	 * （SIGNALED|TIMESTAMP|ACTIVE，ENABLE_SIGNAL=0）却读不到对应 seqno，
+	 * 但树里所有 signal 点要么会置 ENABLE_SIGNAL、要么走不到这里；
+	 * 只有把来源直接记下来才能定位。此字段只用于诊断，不参与任何判据。
+	 */
+	u8 dbg_signal_origin;
+	u32 dbg_signal_hwsp;
+
 	I915_SELFTEST_DECLARE(struct {
 		struct list_head link;
 		unsigned long delay;
@@ -234,6 +244,22 @@ struct i915_request {
 };
 
 #define I915_FENCE_GFP (GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN)
+
+/* Task#208 第十四轮：请求 fence 的所有已知 signal 入口标记 */
+enum i915_dbg_signal_origin {
+	I915_DBG_SIG_NONE = 0,
+	I915_DBG_SIG_RETIRE,		/* i915_request_retire() 的 signal_locked */
+	I915_DBG_SIG_WAIT_SPIN,		/* i915_request_wait() 自旋快路径 */
+	I915_DBG_SIG_WAIT_LOOP,		/* i915_request_wait() 等待循环 */
+	I915_DBG_SIG_BREADCRUMB,	/* intel_engine_breadcrumbs_irq() 开环 signal */
+	I915_DBG_SIG_OBJ_FREE,		/* 对象释放时 resv fence（已加判据） */
+};
+
+static inline void i915_dbg_signal_origin(struct i915_request *rq, u8 origin)
+{
+	rq->dbg_signal_origin = origin;
+	rq->dbg_signal_hwsp = rq->hwsp_seqno ? READ_ONCE(*rq->hwsp_seqno) : 0;
+}
 
 extern const struct dma_fence_ops i915_fence_ops;
 

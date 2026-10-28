@@ -172,6 +172,8 @@ static void __free_object_fence(struct drm_i915_private *i915,
 		struct i915_request *rq = to_request(fence);
 
 		if (i915_request_completed(rq)) {
+			if (!i915_request_signaled(rq))
+				i915_dbg_signal_origin(rq, I915_DBG_SIG_OBJ_FREE);
 			dma_fence_signal(fence);
 			return;
 		}
